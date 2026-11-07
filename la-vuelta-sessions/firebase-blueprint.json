@@ -1,0 +1,153 @@
+{
+  "entities": {
+    "UserPublic": {
+      "title": "UserPublic",
+      "description": "Non-sensitive user profile metadata.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "role": { "type": "string", "enum": ["super_admin", "event_manager", "promo_designer", "payment_reviewer", "door_staff", "gallery_editor", "client"] },
+        "blocked": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "role", "blocked", "createdAt", "updatedAt"]
+    },
+    "UserPrivate": {
+      "title": "UserPrivate",
+      "description": "Protected personal identifiable information for a registered user.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "email": { "type": "string", "minLength": 3, "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "cedula": { "type": "string", "maxLength": 24 },
+        "birthDate": { "type": "string", "maxLength": 10 },
+        "birthMonth": { "type": "integer" },
+        "birthDay": { "type": "integer" },
+        "marketingOptIn": { "type": "boolean" },
+        "profileCompleted": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "email", "phone", "cedula", "birthDate", "birthMonth", "birthDay", "marketingOptIn", "profileCompleted", "createdAt", "updatedAt"]
+    },
+    "StaffRole": {
+      "title": "StaffRole",
+      "description": "RBAC role and granular permission assignment managed strictly by super admins.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "role": { "type": "string", "enum": ["super_admin", "event_manager", "promo_designer", "payment_reviewer", "door_staff", "gallery_editor", "client"] },
+        "permissions": { "type": "array", "description": "Bounded list of permission keys (max 20)." },
+        "active": { "type": "boolean" },
+        "assignedBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "role", "permissions", "active", "assignedBy", "createdAt", "updatedAt"]
+    },
+    "EventItem": {
+      "title": "EventItem",
+      "description": "Music session or urban event published on LA VUELTA SESSIONS.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 1000 },
+        "category": { "type": "string", "maxLength": 60 },
+        "date": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "isoDate": { "type": "string", "maxLength": 10 },
+        "time": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "city": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "venue": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "generalPrice": { "type": "number" },
+        "generalCapacity": { "type": "integer" },
+        "vipPrice": { "type": "number" },
+        "vipCapacity": { "type": "integer" },
+        "accessConditions": { "type": "string", "maxLength": 300 },
+        "promoInfo": { "type": "string", "maxLength": 300 },
+        "specialCampaignId": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "enum": ["draft", "published", "unpublished", "archived"] },
+        "published": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "description", "category", "date", "isoDate", "time", "city", "venue", "generalPrice", "generalCapacity", "vipPrice", "vipCapacity", "accessConditions", "promoInfo", "specialCampaignId", "status", "published", "createdAt", "updatedAt"]
+    },
+    "SpecialCampaign": {
+      "title": "SpecialCampaign",
+      "description": "Seasonal or thematic special event campaign independent of individual event stats.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "season": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "promoText": { "type": "string", "maxLength": 500 },
+        "accentPrimary": { "type": "string", "maxLength": 20 },
+        "accentSecondary": { "type": "string", "maxLength": 20 },
+        "startDate": { "type": "string", "maxLength": 10 },
+        "endDate": { "type": "string", "maxLength": 10 },
+        "active": { "type": "boolean" },
+        "published": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "season", "promoText", "accentPrimary", "accentSecondary", "startDate", "endDate", "active", "published", "createdAt", "updatedAt"]
+    },
+    "OrderRecord": {
+      "title": "OrderRecord",
+      "description": "Ticket purchase order awaiting or holding payment review.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "eventId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ticketType": { "type": "string", "enum": ["general", "vip", "mixed"] },
+        "qty": { "type": "integer", "description": "Total tickets in order, bounded strictly by event capacity (1..100000)." },
+        "unitPrice": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["pago_movil", "transferencia", "binance"] },
+        "reference": { "type": "string", "minLength": 4, "maxLength": 64 },
+        "paymentDate": { "type": "string", "maxLength": 20 },
+        "payerName": { "type": "string", "maxLength": 100 },
+        "payerCedula": { "type": "string", "maxLength": 24 },
+        "payerPhone": { "type": "string", "maxLength": 30 },
+        "payerEmail": { "type": "string", "maxLength": 120 },
+        "hasVoucher": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "refunded"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "eventId", "ticketType", "qty", "unitPrice", "totalAmount", "paymentMethod", "reference", "paymentDate", "status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users_public/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublic" },
+      "description": "Public non-PII user display metadata."
+    },
+    "/users_private/{userId}": {
+      "schema": { "$ref": "#/entities/UserPrivate" },
+      "description": "Isolated PII user profile restricted strictly to owner and bootstrapped admin."
+    },
+    "/staff_roles/{userId}": {
+      "schema": { "$ref": "#/entities/StaffRole" },
+      "description": "RBAC role and granular permissions document."
+    },
+    "/events/{eventId}": {
+      "schema": { "$ref": "#/entities/EventItem" },
+      "description": "Event catalog records."
+    },
+    "/special_campaigns/{campaignId}": {
+      "schema": { "$ref": "#/entities/SpecialCampaign" },
+      "description": "Seasonal special event campaigns."
+    },
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/OrderRecord" },
+      "description": "User ticket purchase orders."
+    }
+  }
+}

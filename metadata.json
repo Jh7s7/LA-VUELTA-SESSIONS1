@@ -1,0 +1,6 @@
+{
+  "name": "LA VUELTA SESSIONS",
+  "description": "Plataforma venezolana de eventos urbanos, venta de entradas, pagos verificados, códigos QR únicos y panel administrativo con control de roles.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

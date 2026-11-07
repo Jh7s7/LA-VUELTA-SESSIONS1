@@ -1,0 +1,212 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Bebas Neue', sans-serif;
+    --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+    --lv-red: #E50914;
+    --lv-gold: #D4AF37;
+    --lv-ember: #FF5722;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+  letter-spacing: 0.03em;
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.lv-stage-backdrop {
+  position: relative;
+  overflow: hidden;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 18% 0%, rgba(229, 9, 20, 0.16), transparent 65%),
+    radial-gradient(ellipse 60% 45% at 88% 12%, rgba(212, 175, 55, 0.1), transparent 60%);
+}
+
+.lv-ticket-perforation {
+  background-image: linear-gradient(to bottom, rgba(161, 161, 170, 0.35) 50%, transparent 50%);
+  background-size: 1px 10px;
+  background-repeat: repeat-y;
+}
+
+.lv-luxury-sheen {
+  position: relative;
+  overflow: hidden;
+}
+
+.lv-luxury-sheen::after {
+  content: '';
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    112deg,
+    transparent 32%,
+    rgba(255, 255, 255, 0.09) 48%,
+    rgba(212, 175, 55, 0.11) 52%,
+    transparent 68%
+  );
+  transform: translate3d(-120%, 0, 0);
+  opacity: 0;
+  transition: transform 0.65s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease;
+}
+
+.lv-luxury-sheen:hover::after {
+  transform: translate3d(120%, 0, 0);
+  opacity: 1;
+}
+
+@keyframes eqPulse {
+  0%, 100% {
+    transform: scaleY(0.34);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+.eq-bar {
+  transform-origin: bottom;
+  will-change: transform;
+  animation: eqPulse 1.35s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+@keyframes lvMarqueeScroll {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  100% {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+
+.lv-marquee-track {
+  display: flex;
+  align-items: center;
+  width: max-content;
+  will-change: transform;
+  animation: lvMarqueeScroll 34s linear infinite;
+}
+
+.lv-marquee-viewport:hover .lv-marquee-track,
+.lv-marquee-viewport:focus-within .lv-marquee-track {
+  animation-play-state: paused;
+}
+
+@keyframes lvOrbitSpin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes lvSealBeat {
+  0%, 100% {
+    transform: scale(1) rotate(-3.5deg);
+  }
+  50% {
+    transform: scale(1.055) rotate(3.5deg);
+  }
+}
+
+@keyframes lvHaloPulse {
+  0%, 100% {
+    transform: scale(0.92);
+    opacity: 0.32;
+  }
+  50% {
+    transform: scale(1.18);
+    opacity: 0.78;
+  }
+}
+
+@keyframes lvScanSweep {
+  0%, 100% {
+    transform: translateY(-6px);
+    opacity: 0.45;
+  }
+  50% {
+    transform: translateY(6px);
+    opacity: 1;
+  }
+}
+
+.lv-orbit-ring {
+  transform-origin: center;
+  will-change: transform;
+  animation: lvOrbitSpin 9s linear infinite;
+}
+
+.group:hover .lv-orbit-ring {
+  animation-duration: 2.4s;
+}
+
+.lv-orbit-ring-slow {
+  transform-origin: center;
+  will-change: transform;
+  animation: lvOrbitSpin 14s linear infinite;
+}
+
+.group:hover .lv-orbit-ring-slow {
+  animation-duration: 3.2s;
+}
+
+.lv-seal-disc {
+  transform-origin: center;
+  will-change: transform;
+  animation: lvSealBeat 2.8s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+.lv-seal-halo {
+  transform-origin: center;
+  will-change: transform, opacity;
+  animation: lvHaloPulse 2.8s ease-in-out infinite;
+}
+
+.lv-mini-wave {
+  transform-origin: center;
+  will-change: transform;
+  animation: eqPulse 1.2s ease-in-out infinite;
+}
+
+.lv-qr-laser {
+  will-change: transform, opacity;
+  animation: lvScanSweep 2.1s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes lvStageAura {
+    0%, 100% {
+      transform: translate3d(0, 0, 0) scale(1);
+      opacity: 0.75;
+    }
+    50% {
+      transform: translate3d(1.5%, -1.5%, 0) scale(1.06);
+      opacity: 1;
+    }
+  }
+
+  .lv-ambient-aura {
+    will-change: transform, opacity;
+    animation: lvStageAura 9s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+  }
+}

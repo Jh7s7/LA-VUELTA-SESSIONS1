@@ -1,0 +1,316 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'lavueltassessionsoficial@gmail.com'
+        || request.auth.token.email == 'forgen122@gmail.com'
+      );
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function hasActiveStaffRole(allowedRoles) {
+      return isVerifiedUser()
+        && exists(/databases/$(database)/documents/staff_roles/$(request.auth.uid))
+        && get(/databases/$(database)/documents/staff_roles/$(request.auth.uid)).data.active == true
+        && get(/databases/$(database)/documents/staff_roles/$(request.auth.uid)).data.role in allowedRoles;
+    }
+
+    // Validation Blueprints
+    function isValidUserPublic(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'blocked', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'role', 'blocked', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.role is string && data.role.size() <= 32
+        && data.role in ['super_admin', 'event_manager', 'promo_designer', 'payment_reviewer', 'door_staff', 'gallery_editor', 'client']
+        && data.blocked is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivate(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'phone', 'cedula', 'birthDate', 'birthMonth', 'birthDay', 'marketingOptIn', 'profileCompleted', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'phone', 'cedula', 'birthDate', 'birthMonth', 'birthDay', 'marketingOptIn', 'profileCompleted', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 120
+        && data.phone is string && data.phone.size() <= 30
+        && data.cedula is string && data.cedula.size() <= 24
+        && data.birthDate is string && data.birthDate.size() <= 10
+        && data.birthMonth is int && data.birthMonth >= 0 && data.birthMonth <= 12
+        && data.birthDay is int && data.birthDay >= 0 && data.birthDay <= 31
+        && data.marketingOptIn is bool
+        && data.profileCompleted is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStaffRole(data) {
+      return data.keys().hasAll(['uid', 'role', 'permissions', 'active', 'assignedBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'role', 'permissions', 'active', 'assignedBy', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.role is string && data.role.size() <= 32
+        && data.role in ['super_admin', 'event_manager', 'promo_designer', 'payment_reviewer', 'door_staff', 'gallery_editor', 'client']
+        && data.permissions is list && data.permissions.size() <= 20
+        && (data.permissions.size() == 0 || (data.permissions[0] is string && data.permissions[0].size() <= 40))
+        && data.active is bool
+        && data.assignedBy is string && data.assignedBy.size() >= 1 && data.assignedBy.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidEventItem(data) {
+      return data.keys().hasAll(['id', 'title', 'description', 'category', 'date', 'isoDate', 'time', 'city', 'venue', 'generalPrice', 'generalCapacity', 'vipPrice', 'vipCapacity', 'accessConditions', 'promoInfo', 'specialCampaignId', 'status', 'published', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'title', 'description', 'category', 'date', 'isoDate', 'time', 'city', 'venue', 'generalPrice', 'generalCapacity', 'vipPrice', 'vipCapacity', 'accessConditions', 'promoInfo', 'specialCampaignId', 'status', 'published', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 100
+        && data.description is string && data.description.size() <= 1000
+        && data.category is string && data.category.size() <= 60
+        && data.date is string && data.date.size() >= 1 && data.date.size() <= 20
+        && data.isoDate is string && data.isoDate.size() <= 10
+        && data.time is string && data.time.size() >= 1 && data.time.size() <= 20
+        && data.city is string && data.city.size() >= 1 && data.city.size() <= 60
+        && data.venue is string && data.venue.size() >= 1 && data.venue.size() <= 120
+        && (data.generalPrice is int || data.generalPrice is float) && data.generalPrice >= 0
+        && data.generalCapacity is int && data.generalCapacity >= 0 && data.generalCapacity <= 100000
+        && (data.vipPrice is int || data.vipPrice is float) && data.vipPrice >= 0
+        && data.vipCapacity is int && data.vipCapacity >= 0 && data.vipCapacity <= 100000
+        && data.accessConditions is string && data.accessConditions.size() <= 300
+        && data.promoInfo is string && data.promoInfo.size() <= 300
+        && data.specialCampaignId is string && data.specialCampaignId.size() <= 128
+        && data.status is string && data.status.size() <= 20
+        && data.status in ['draft', 'published', 'unpublished', 'archived']
+        && data.published is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSpecialCampaign(data) {
+      return data.keys().hasAll(['id', 'name', 'season', 'promoText', 'accentPrimary', 'accentSecondary', 'startDate', 'endDate', 'active', 'published', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'name', 'season', 'promoText', 'accentPrimary', 'accentSecondary', 'startDate', 'endDate', 'active', 'published', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && data.season is string && data.season.size() >= 1 && data.season.size() <= 60
+        && data.promoText is string && data.promoText.size() <= 500
+        && data.accentPrimary is string && data.accentPrimary.size() <= 20
+        && data.accentSecondary is string && data.accentSecondary.size() <= 20
+        && data.startDate is string && data.startDate.size() <= 10
+        && data.endDate is string && data.endDate.size() <= 10
+        && data.active is bool
+        && data.published is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidOrderRecord(data) {
+      return data.keys().hasAll(['id', 'userId', 'eventId', 'ticketType', 'qty', 'unitPrice', 'totalAmount', 'paymentMethod', 'reference', 'paymentDate', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'userId', 'eventId', 'ticketType', 'qty', 'unitPrice', 'totalAmount', 'paymentMethod', 'reference', 'paymentDate', 'status', 'createdAt', 'updatedAt', 'payerName', 'payerCedula', 'payerPhone', 'payerEmail', 'hasVoucher'])
+        && isValidId(data.id)
+        && isValidId(data.userId)
+        && isValidId(data.eventId)
+        && data.ticketType is string && data.ticketType.size() <= 16
+        && data.ticketType in ['general', 'vip', 'mixed']
+        && data.qty is int && data.qty >= 1 && data.qty <= 100000
+        && (data.unitPrice is int || data.unitPrice is float) && data.unitPrice >= 0
+        && (data.totalAmount is int || data.totalAmount is float) && data.totalAmount >= 0
+        && data.paymentMethod is string && data.paymentMethod.size() <= 24
+        && data.paymentMethod in ['pago_movil', 'transferencia', 'binance']
+        && data.reference is string && data.reference.size() >= 4 && data.reference.size() <= 64
+        && data.paymentDate is string && data.paymentDate.size() <= 20
+        && (!('payerName' in data) || (data.payerName is string && data.payerName.size() <= 100))
+        && (!('payerCedula' in data) || (data.payerCedula is string && data.payerCedula.size() <= 24))
+        && (!('payerPhone' in data) || (data.payerPhone is string && data.payerPhone.size() <= 30))
+        && (!('payerEmail' in data) || (data.payerEmail is string && data.payerEmail.size() <= 120))
+        && (!('hasVoucher' in data) || (data.hasVoucher is bool))
+        && data.status is string && data.status.size() <= 16
+        && data.status in ['pending', 'approved', 'rejected', 'refunded']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Collection 1: users_public
+    match /users_public/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isBootstrappedAdmin() || hasActiveStaffRole(['super_admin', 'payment_reviewer', 'door_staff']));
+      allow list: if isBootstrappedAdmin() || (isSignedIn() && existing().uid == request.auth.uid);
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserPublic(incoming())
+        && incoming().uid == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrappedAdmin()
+          || (isOwner(userId) && incoming().role == 'client' && incoming().blocked == false)
+        );
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserPublic(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrappedAdmin()
+          || (
+            isOwner(userId)
+            && existing().blocked == false
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+          )
+        );
+      allow delete: if isBootstrappedAdmin() && isValidId(userId);
+    }
+
+    // Collection 2: users_private (Strict PII Isolation)
+    match /users_private/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isBootstrappedAdmin() || hasActiveStaffRole(['super_admin']));
+      allow list: if isBootstrappedAdmin() || (isSignedIn() && existing().uid == request.auth.uid);
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserPrivate(incoming())
+        && incoming().uid == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (isOwner(userId) || isBootstrappedAdmin());
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserPrivate(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrappedAdmin()
+          || (
+            isOwner(userId)
+            && incoming().email == existing().email
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'phone', 'cedula', 'birthDate', 'birthMonth', 'birthDay', 'marketingOptIn', 'profileCompleted', 'updatedAt'])
+          )
+        );
+      allow delete: if isBootstrappedAdmin() && isValidId(userId);
+    }
+
+    // Collection 3: staff_roles (Zero Self-Elevation)
+    match /staff_roles/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isBootstrappedAdmin() || hasActiveStaffRole(['super_admin']));
+      allow list: if isBootstrappedAdmin() || (isSignedIn() && existing().uid == request.auth.uid);
+      allow create: if isBootstrappedAdmin()
+        && isValidId(userId)
+        && isValidStaffRole(incoming())
+        && incoming().uid == userId
+        && incoming().assignedBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isBootstrappedAdmin()
+        && isValidId(userId)
+        && isValidStaffRole(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isBootstrappedAdmin() && isValidId(userId);
+    }
+
+    // Collection 4: events
+    match /events/{eventId} {
+      allow get: if isValidId(eventId) && (existing().published == true || isBootstrappedAdmin() || hasActiveStaffRole(['super_admin', 'event_manager', 'promo_designer', 'payment_reviewer', 'door_staff']));
+      allow list: if existing().published == true || isBootstrappedAdmin();
+      allow create: if isVerifiedUser()
+        && isValidId(eventId)
+        && isValidEventItem(incoming())
+        && incoming().id == eventId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (isBootstrappedAdmin() || hasActiveStaffRole(['super_admin', 'event_manager']));
+      allow update: if isVerifiedUser()
+        && isValidId(eventId)
+        && isValidEventItem(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (isBootstrappedAdmin() || hasActiveStaffRole(['super_admin', 'event_manager']));
+      allow delete: if isValidId(eventId) && isBootstrappedAdmin();
+    }
+
+    // Collection 5: special_campaigns
+    match /special_campaigns/{campaignId} {
+      allow get: if isValidId(campaignId) && (existing().published == true || isBootstrappedAdmin() || hasActiveStaffRole(['super_admin', 'event_manager', 'promo_designer']));
+      allow list: if existing().published == true || isBootstrappedAdmin();
+      allow create: if isVerifiedUser()
+        && isValidId(campaignId)
+        && isValidSpecialCampaign(incoming())
+        && incoming().id == campaignId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (isBootstrappedAdmin() || hasActiveStaffRole(['super_admin', 'event_manager', 'promo_designer']));
+      allow update: if isVerifiedUser()
+        && isValidId(campaignId)
+        && isValidSpecialCampaign(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (isBootstrappedAdmin() || hasActiveStaffRole(['super_admin', 'event_manager', 'promo_designer']));
+      allow delete: if isValidId(campaignId) && isBootstrappedAdmin();
+    }
+
+    // Collection 6: orders (Terminal State Locked)
+    match /orders/{orderId} {
+      allow get: if isSignedIn() && isValidId(orderId) && (existing().userId == request.auth.uid || isBootstrappedAdmin() || hasActiveStaffRole(['super_admin', 'payment_reviewer']));
+      allow list: if (isSignedIn() && existing().userId == request.auth.uid) || isBootstrappedAdmin();
+      allow create: if isVerifiedUser()
+        && isValidId(orderId)
+        && isValidOrderRecord(incoming())
+        && incoming().id == orderId
+        && incoming().userId == request.auth.uid
+        && incoming().status == 'pending'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/events/$(incoming().eventId));
+      allow update: if isVerifiedUser()
+        && isValidId(orderId)
+        && isValidOrderRecord(incoming())
+        && incoming().id == existing().id
+        && incoming().userId == existing().userId
+        && incoming().eventId == existing().eventId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isBootstrappedAdmin()
+          || (
+            hasActiveStaffRole(['super_admin', 'payment_reviewer'])
+            && existing().status == 'pending'
+            && incoming().status in ['approved', 'rejected']
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(orderId) && isBootstrappedAdmin();
+    }
+  }
+}
