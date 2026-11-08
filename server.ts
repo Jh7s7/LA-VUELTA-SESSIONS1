@@ -6,6 +6,20 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import QRCode from 'qrcode';
+import {
+  getPgPool,
+  closePgPool,
+  ensurePostgresSchema,
+  getOrCreateQrHmacSecret,
+  isPostgresPopulated,
+  loadDatabaseFromPostgres,
+  enqueuePostgresPersist,
+  saveVoucherToPostgres,
+  getVoucherFromPostgres,
+  deleteVoucherFromPostgres,
+  exportFullPostgresBackup,
+  loadLegacyVouchersFromDisk,
+} from './db.ts';
 
 dotenv.config();
 
@@ -114,7 +128,7 @@ function getActiveLbApiKey(): string {
   return raw;
 }
 
-const QR_SECRET = getHmacSecret();
+let QR_SECRET = getHmacSecret();
 
 type UserRole =
   | 'super_admin'
@@ -765,36 +779,65 @@ function normalizeEventsSchema(loaded: DatabaseSchema): boolean {
   return mutated;
 }
 
-function loadDb(): DatabaseSchema {
-  try {
-    let sourcePath = '';
-    if (fs.existsSync(WORKSPACE_DB_FILE)) {
-      sourcePath = WORKSPACE_DB_FILE;
-    } else if (fs.existsSync(DB_FILE)) {
-      sourcePath = DB_FILE;
-    }
+function loadSeedDbForInitialMigration(): DatabaseSchema {
+  let sourcePath = '';
+  if (fs.existsSync(WORKSPACE_DB_FILE)) {
+    sourcePath = WORKSPACE_DB_FILE;
+  } else if (fs.existsSync(DB_FILE)) {
+    sourcePath = DB_FILE;
+  }
 
-    if (!sourcePath) {
-      const initial = buildInitialDb();
-      normalizeEventsSchema(initial);
-      try {
-        if (!fs.existsSync(WORKSPACE_DATA_DIR)) {
-          fs.mkdirSync(WORKSPACE_DATA_DIR, { recursive: true });
-        }
-        fs.writeFileSync(WORKSPACE_DB_FILE, JSON.stringify(initial, null, 2), { mode: 0o600 });
-        fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), { mode: 0o600 });
-      } catch (writeErr) {
-        console.warn('Warning: Could not persist initial DB file:', writeErr);
-      }
-      return initial;
-    }
+  const parsed: DatabaseSchema = sourcePath
+    ? JSON.parse(fs.readFileSync(sourcePath, 'utf8'))
+    : buildInitialDb();
 
-    const parsed: DatabaseSchema = JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
-    const m1 = ensureOfficialAdminAccount(parsed);
-    const m2 = normalizeEventsSchema(parsed);
+  ensureOfficialAdminAccount(parsed);
+  normalizeEventsSchema(parsed);
+  if (!parsed.exchangeRate || typeof parsed.exchangeRate.rate !== 'number') {
+    parsed.exchangeRate = {
+      rate: 896.12,
+      currency: 'VES',
+      source: 'Banco Central de Venezuela (BCV Oficial)',
+      lastUpdated: new Date().toISOString(),
+      mode: 'auto',
+    };
+  }
+  return parsed;
+}
+
+let db: DatabaseSchema = buildInitialDb();
+
+function persistDb(): Promise<void> {
+  return enqueuePostgresPersist(db).catch((err) => {
+    console.error('CRITICAL: Failed to persist state to PostgreSQL:', err);
+    throw err;
+  });
+}
+
+async function initDatabaseOrFail(): Promise<void> {
+  const pool = getPgPool();
+  // Fail-fast check: refuse to start if PostgreSQL is unreachable
+  await pool.query('SELECT 1');
+  await ensurePostgresSchema(pool);
+
+  QR_SECRET = await getOrCreateQrHmacSecret(SECRET_FILE, PLACEHOLDER_SECRETS, pool);
+
+  const populated = await isPostgresPopulated(pool);
+  if (!populated) {
+    const seed = loadSeedDbForInitialMigration();
+    const legacyVouchers = loadLegacyVouchersFromDisk(VOUCHERS_DIR);
+    await enqueuePostgresPersist(seed, legacyVouchers);
+    db = seed;
+    console.log(
+      `[PostgreSQL] Initialized database from seed (${db.users.length} users, ${db.events.length} events, ${db.orders.length} orders, ${legacyVouchers.length} vouchers).`
+    );
+  } else {
+    const loaded = await loadDatabaseFromPostgres<DatabaseSchema>(pool);
+    const m1 = ensureOfficialAdminAccount(loaded);
+    const m2 = normalizeEventsSchema(loaded);
     let m3 = false;
-    if (!parsed.exchangeRate || typeof parsed.exchangeRate.rate !== 'number') {
-      parsed.exchangeRate = {
+    if (!loaded.exchangeRate || typeof loaded.exchangeRate.rate !== 'number') {
+      loaded.exchangeRate = {
         rate: 896.12,
         currency: 'VES',
         source: 'Banco Central de Venezuela (BCV Oficial)',
@@ -803,29 +846,15 @@ function loadDb(): DatabaseSchema {
       };
       m3 = true;
     }
+    db = loaded;
     if (m1 || m2 || m3) {
-      try {
-        fs.writeFileSync(sourcePath, JSON.stringify(parsed, null, 2), { mode: 0o600 });
-        if (sourcePath !== WORKSPACE_DB_FILE) {
-          if (!fs.existsSync(WORKSPACE_DATA_DIR)) {
-            fs.mkdirSync(WORKSPACE_DATA_DIR, { recursive: true });
-          }
-          fs.writeFileSync(WORKSPACE_DB_FILE, JSON.stringify(parsed, null, 2), { mode: 0o600 });
-        }
-      } catch (writeErr) {
-        console.warn('Warning: Could not update normalized DB file:', writeErr);
-      }
+      await persistDb();
     }
-    return parsed;
-  } catch (err) {
-    console.warn('Warning: Falling back to in-memory initial DB:', err);
-    const fallbackDb = buildInitialDb();
-    normalizeEventsSchema(fallbackDb);
-    return fallbackDb;
+    console.log(
+      `[PostgreSQL] Loaded persistent state (${db.users.length} users, ${db.events.length} events, ${db.orders.length} orders, ${db.tickets.length} tickets).`
+    );
   }
 }
-
-let db: DatabaseSchema = loadDb();
 
 async function updateOfficialExchangeRate(): Promise<void> {
   if (db?.exchangeRate?.mode === 'manual') {
@@ -850,7 +879,7 @@ async function updateOfficialExchangeRate(): Promise<void> {
           lastUpdated: data.fechaActualizacion || new Date().toISOString(),
           mode: 'auto',
         };
-        persistDb();
+        await persistDb();
       }
     }
   } catch {
@@ -862,42 +891,8 @@ async function updateOfficialExchangeRate(): Promise<void> {
         lastUpdated: new Date().toISOString(),
         mode: 'auto',
       };
-      persistDb();
+      await persistDb();
     }
-  }
-}
-
-// Automatically fetch live rate at boot and every 30 minutes
-void updateOfficialExchangeRate();
-setInterval(() => {
-  void updateOfficialExchangeRate();
-}, 30 * 60 * 1000);
-
-function persistDb(): void {
-  try {
-    const serialized = JSON.stringify(db, null, 2);
-    // 1. Write to DB_FILE (.private_data/db.json)
-    try {
-      const tmp = `${DB_FILE}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, serialized, { mode: 0o600 });
-      fs.renameSync(tmp, DB_FILE);
-    } catch (e1) {
-      console.warn('Warning: Could not write DB_FILE:', e1);
-    }
-
-    // 2. Write to permanent WORKSPACE_DB_FILE (data/persistent_db.json)
-    try {
-      if (!fs.existsSync(WORKSPACE_DATA_DIR)) {
-        fs.mkdirSync(WORKSPACE_DATA_DIR, { recursive: true });
-      }
-      const wsTmp = `${WORKSPACE_DB_FILE}.${process.pid}.tmp`;
-      fs.writeFileSync(wsTmp, serialized, { mode: 0o600 });
-      fs.renameSync(wsTmp, WORKSPACE_DB_FILE);
-    } catch (e2) {
-      console.warn('Warning: Could not write WORKSPACE_DB_FILE:', e2);
-    }
-  } catch (err) {
-    console.warn('Warning: Could not persist DB snapshot:', err);
   }
 }
 
@@ -1120,7 +1115,7 @@ function clearSessionCookie(res: Response) {
   res.setHeader('Set-Cookie', 'lv_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax');
 }
 
-function createSessionForUser(user: StoredUser, res: Response): string {
+async function createSessionForUser(user: StoredUser, res: Response): Promise<string> {
   const rawToken = crypto.randomBytes(32).toString('hex');
   const now = Date.now();
   db.sessions = db.sessions.filter((s) => s.expiresAt > now);
@@ -1130,21 +1125,41 @@ function createSessionForUser(user: StoredUser, res: Response): string {
     expiresAt: now + 7 * 24 * 3600 * 1000,
     createdAt: new Date(now).toISOString(),
   });
-  persistDb();
+  await persistDb();
   setSessionCookie(res, rawToken);
   return rawToken;
 }
 
-function attachUser(req: AuthedRequest, _res: Response, next: NextFunction) {
-  const raw = extractSessionToken(req);
-  if (!raw) return next();
-  const th = hashToken(raw);
-  const now = Date.now();
-  const sess = db.sessions.find((s) => s.tokenHash === th && s.expiresAt > now);
-  if (!sess) return next();
-  const u = db.users.find((x) => x.id === sess.userId && !x.blocked);
-  if (u) req.user = u;
-  next();
+async function attachUser(req: AuthedRequest, _res: Response, next: NextFunction) {
+  try {
+    const raw = extractSessionToken(req);
+    if (!raw) return next();
+    const th = hashToken(raw);
+    const now = Date.now();
+    let sess = db.sessions.find((s) => s.tokenHash === th && s.expiresAt > now);
+    if (!sess) {
+      const pgSess = await getPgPool().query(
+        `SELECT token_hash, user_id, expires_at, created_at FROM sessions WHERE token_hash = $1 AND expires_at > $2 LIMIT 1`,
+        [th, now]
+      );
+      if (pgSess.rows.length > 0) {
+        const r = pgSess.rows[0];
+        sess = {
+          tokenHash: r.token_hash,
+          userId: r.user_id,
+          expiresAt: Number(r.expires_at),
+          createdAt: r.created_at,
+        };
+        db.sessions.push(sess);
+      }
+    }
+    if (!sess) return next();
+    const u = db.users.find((x) => x.id === sess.userId && !x.blocked);
+    if (u) req.user = u;
+    next();
+  } catch (err) {
+    next(err);
+  }
 }
 
 function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
@@ -1288,6 +1303,15 @@ function computeEventStats(filters?: {
 }
 
 async function startServer() {
+  await initDatabaseOrFail();
+
+  // Automatically fetch live rate at boot and every 30 minutes
+  void updateOfficialExchangeRate();
+  const rateInterval = setInterval(() => {
+    void updateOfficialExchangeRate();
+  }, 30 * 60 * 1000);
+  rateInterval.unref?.();
+
   const app = express();
   app.set('trust proxy', 1);
 
@@ -1480,8 +1504,11 @@ async function startServer() {
       ? db.tickets.filter((t) => t.userId === req.user!.id)
       : [];
 
+    const sanitizedUser = req.user ? sanitizeUserForClient(req.user) : null;
+
     res.json({
-      currentUser: req.user ? sanitizeUserForClient(req.user) : null,
+      currentUser: sanitizedUser,
+      user: sanitizedUser,
       events: publicEvents,
       specialCampaigns: publicCampaigns,
       seasons: db.seasons,
@@ -1512,7 +1539,7 @@ async function startServer() {
   // =========================================================
   // AUTHENTICATION & SECURITY (Module 6)
   // =========================================================
-  app.post('/api/auth/register', (req: Request, res: Response) => {
+  app.post('/api/auth/register', async (req: Request, res: Response) => {
     const { name, email, phone, cedula, birthDate, password, marketingOptIn } = req.body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanName = String(name || '').trim();
@@ -1576,7 +1603,7 @@ async function startServer() {
     };
 
     db.users.push(newUser);
-    const token = createSessionForUser(newUser, res);
+    const token = await createSessionForUser(newUser, res);
     const hasEmailProvider = Boolean(getActiveResendKey());
 
     res.json({
@@ -1589,7 +1616,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/auth/verify-email', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.post('/api/auth/verify-email', requireAuth, async (req: AuthedRequest, res: Response) => {
     const code = String(req.body?.code || '').trim();
     const u = req.user!;
     if (u.emailVerified) {
@@ -1603,11 +1630,11 @@ async function startServer() {
     u.emailVerified = true;
     u.emailVerifyCode = '';
     u.updatedAt = new Date().toISOString();
-    persistDb();
+    await persistDb();
     res.json({ user: sanitizeUserForClient(u) });
   });
 
-  const handleCredentialLogin = (req: Request, res: Response, requireValidatorRole: boolean) => {
+  const handleCredentialLogin = async (req: Request, res: Response, requireValidatorRole: boolean) => {
     const rawEmail = req.body?.email ?? req.body?.correo ?? req.body?.username ?? '';
     const rawPass =
       req.body?.password ?? req.body?.contraseña ?? req.body?.contrasena ?? req.body?.clave ?? '';
@@ -1618,6 +1645,7 @@ async function startServer() {
     const check = checkLoginRateLimit(rateKey);
     if (!check.allowed) {
       recordSecurityAudit('LOGIN_RATE_LIMIT_TRIGGERED', 'warning', req, `Límite de intentos superado para: ${cleanEmail}`);
+      await persistDb();
       res.status(429).json({
         ok: false,
         error: `Demasiados intentos fallidos. Intenta nuevamente en ${check.waitSeconds} segundos.`,
@@ -1629,11 +1657,13 @@ async function startServer() {
     if (!user || !verifyPassword(pass, user.passwordSalt, user.passwordHash)) {
       recordFailedLogin(rateKey);
       recordSecurityAudit('LOGIN_FAILED_CREDENTIALS', 'warning', req, `Contraseña incorrecta o usuario inexistente: ${cleanEmail}`);
+      await persistDb();
       res.status(401).json({ ok: false, error: 'Correo o contraseña incorrectos.' });
       return;
     }
     if (user.blocked) {
       recordSecurityAudit('LOGIN_BLOCKED_ACCOUNT', 'critical', req, `Intento de acceso a cuenta suspendida: ${cleanEmail}`);
+      await persistDb();
       res.status(403).json({ ok: false, error: 'Esta cuenta se encuentra suspendida por administración.' });
       return;
     }
@@ -1641,6 +1671,7 @@ async function startServer() {
     const perms = getEffectivePermissions(user);
     if (requireValidatorRole && !perms.includes('validator')) {
       recordSecurityAudit('LOGIN_UNAUTHORIZED_ROLE', 'warning', req, `Intento de acceso a validador sin permisos: ${cleanEmail}`);
+      await persistDb();
       res.status(403).json({
         ok: false,
         error: 'Acceso solo para administradores y personal autorizado de puerta.',
@@ -1650,7 +1681,7 @@ async function startServer() {
 
     loginAttempts.delete(rateKey);
     recordSecurityAudit('LOGIN_SUCCESS', 'info', req, `Inicio de sesión exitoso como ${user.role}.`, user.email);
-    const token = createSessionForUser(user, res);
+    const token = await createSessionForUser(user, res);
     const safeUser = sanitizeUserForClient(user);
     const activeEvents = perms.includes('validator')
       ? db.events
@@ -1683,21 +1714,21 @@ async function startServer() {
   };
 
   app.post('/api/auth/login', (req: Request, res: Response) => {
-    handleCredentialLogin(req, res, false);
+    void handleCredentialLogin(req, res, false);
   });
 
   // Dedicated login endpoints for LA VUELTA SESSIONS VALIDADOR mobile/external app
   app.post('/api/validator/login', (req: Request, res: Response) => {
-    handleCredentialLogin(req, res, true);
+    void handleCredentialLogin(req, res, true);
   });
   app.post('/api/validador/login', (req: Request, res: Response) => {
-    handleCredentialLogin(req, res, true);
+    void handleCredentialLogin(req, res, true);
   });
   app.post('/api/admin/login', (req: Request, res: Response) => {
-    handleCredentialLogin(req, res, true);
+    void handleCredentialLogin(req, res, true);
   });
   app.post('/api/login', (req: Request, res: Response) => {
-    handleCredentialLogin(req, res, false);
+    void handleCredentialLogin(req, res, false);
   });
 
   // Server-verified Google Sign-In via Firebase IdentityToolkit
@@ -1770,7 +1801,7 @@ async function startServer() {
         user.updatedAt = now;
       }
 
-      const token = createSessionForUser(user, res);
+      const token = await createSessionForUser(user, res);
       res.json({
         token,
         user: sanitizeUserForClient(user),
@@ -1782,7 +1813,7 @@ async function startServer() {
   });
 
   // Complementary profile form after first Google login (Module 6.2)
-  app.post('/api/auth/complete-profile', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.post('/api/auth/complete-profile', requireAuth, async (req: AuthedRequest, res: Response) => {
     const { phone, cedula, birthDate, marketingOptIn, name } = req.body || {};
     const cleanPhone = String(phone || '').trim();
     const cleanCedula = String(cedula || '').trim().toUpperCase();
@@ -1814,13 +1845,13 @@ async function startServer() {
     u.birthDay = parsed.day;
     u.marketingOptIn = Boolean(marketingOptIn);
     u.updatedAt = new Date().toISOString();
-    persistDb();
+    await persistDb();
 
     res.json({ user: sanitizeUserForClient(u) });
   });
 
   // Password Reset Flow
-  app.post('/api/auth/request-reset', (req: Request, res: Response) => {
+  app.post('/api/auth/request-reset', async (req: Request, res: Response) => {
     const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
     const user = db.users.find((u) => u.email === cleanEmail && !u.blocked);
     let devResetCode: string | undefined;
@@ -1828,7 +1859,7 @@ async function startServer() {
       const code = String(crypto.randomInt(100000, 999999));
       user.resetCode = code;
       user.resetExpiresAt = Date.now() + 15 * 60 * 1000;
-      persistDb();
+      await persistDb();
       if (!getActiveResendKey()) {
         devResetCode = code;
       }
@@ -1840,7 +1871,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/auth/reset-password', (req: Request, res: Response) => {
+  app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
     const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
     const code = String(req.body?.code || '').trim();
     const newPassword = String(req.body?.newPassword || '');
@@ -1861,12 +1892,12 @@ async function startServer() {
     user.updatedAt = new Date().toISOString();
     // Invalidate previous sessions
     db.sessions = db.sessions.filter((s) => s.userId !== user.id);
-    persistDb();
+    await persistDb();
     res.json({ ok: true });
   });
 
   // Restricted Role Simulator — Strictly reserved for authenticated Super Admin
-  app.post('/api/auth/demo-role', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.post('/api/auth/demo-role', requireAuth, async (req: AuthedRequest, res: Response) => {
     if (req.user?.role !== 'super_admin') {
       res.status(403).json({ error: 'Acción reservada exclusivamente al Administrador Principal.' });
       return;
@@ -1877,16 +1908,16 @@ async function startServer() {
       res.status(404).json({ error: 'Rol de prueba no encontrado.' });
       return;
     }
-    const token = createSessionForUser(demoAccount, res);
+    const token = await createSessionForUser(demoAccount, res);
     res.json({ token, user: sanitizeUserForClient(demoAccount) });
   });
 
-  app.post('/api/auth/logout', (req: AuthedRequest, res: Response) => {
+  app.post('/api/auth/logout', async (req: AuthedRequest, res: Response) => {
     const raw = extractSessionToken(req);
     if (raw) {
       const th = hashToken(raw);
       db.sessions = db.sessions.filter((s) => s.tokenHash !== th);
-      persistDb();
+      await persistDb();
     }
     clearSessionCookie(res);
     res.json({ ok: true });
@@ -1895,7 +1926,7 @@ async function startServer() {
   // =========================================================
   // ADMIN WORKSPACE DATA (Filtered strictly by RBAC permissions)
   // =========================================================
-  app.get('/api/admin/workspace', requireAuth, (req: AuthedRequest, res: Response) => {
+  const handleAdminWorkspace = (req: AuthedRequest, res: Response) => {
     const perms = getEffectivePermissions(req.user!);
     if (perms.length === 0) {
       res.status(403).json({ error: 'Tu cuenta no posee permisos administrativos.' });
@@ -1967,7 +1998,9 @@ async function startServer() {
         ticketReplayProtection: 'Atomic mutex lock on door validation',
       },
     });
-  });
+  };
+  app.get('/api/admin/workspace', requireAuth, handleAdminWorkspace);
+  app.get('/api/admin/dashboard', requireAuth, handleAdminWorkspace);
 
   // =========================================================
   // MODULE 1.2 & 1.3: PER-EVENT STATS & CSV EXPORT
@@ -2061,7 +2094,7 @@ async function startServer() {
   // =========================================================
   // MODULE 2: EVENTS & SPECIAL CAMPAIGNS
   // =========================================================
-  app.post('/api/admin/events', requirePermission('events'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/events', requirePermission('events'), async (req: AuthedRequest, res: Response) => {
     const b = req.body || {};
     const title = String(b.title || '').trim();
     if (!title) {
@@ -2115,11 +2148,11 @@ async function startServer() {
 
     db.events.unshift(ev);
     appendAudit(req.user!, 'CREATE_EVENT', 'event', ev.id, `Evento creado: ${ev.title} (${ev.status})`);
-    persistDb();
+    await persistDb();
     res.json({ event: ev });
   });
 
-  app.put('/api/admin/events/:id', requirePermission('events'), (req: AuthedRequest, res: Response) => {
+  app.put('/api/admin/events/:id', requirePermission('events'), async (req: AuthedRequest, res: Response) => {
     const ev = db.events.find((e) => e.id === req.params.id);
     if (!ev) {
       res.status(404).json({ error: 'Evento no encontrado.' });
@@ -2171,11 +2204,11 @@ async function startServer() {
     }
     ev.updatedAt = new Date().toISOString();
     appendAudit(req.user!, 'UPDATE_EVENT', 'event', ev.id, `Evento actualizado: ${ev.title} (Capacidad: ${ev.generalCapacity}G + ${ev.vipCapacity}V)`);
-    persistDb();
+    await persistDb();
     res.json({ event: ev });
   });
 
-  app.delete('/api/admin/events/:id', requirePermission('events'), (req: AuthedRequest, res: Response) => {
+  app.delete('/api/admin/events/:id', requirePermission('events'), async (req: AuthedRequest, res: Response) => {
     const idx = db.events.findIndex((e) => e.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Evento no encontrado.' });
@@ -2183,12 +2216,13 @@ async function startServer() {
     }
     const [removed] = db.events.splice(idx, 1);
 
-    // Clean up associated orders, private vouchers, and tickets for this deleted event
+    // Clean up associated orders, private vouchers in PostgreSQL, and tickets for this deleted event
     const removedOrders = db.orders.filter((o) => o.eventId === removed.id);
     for (const ord of removedOrders) {
       memoryVouchers.delete(ord.id);
       const safeOrderId = String(ord.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
       if (safeOrderId) {
+        await deleteVoucherFromPostgres(safeOrderId);
         const voucherPath = path.join(VOUCHERS_DIR, `${safeOrderId}.json`);
         try {
           if (fs.existsSync(voucherPath)) fs.unlinkSync(voucherPath);
@@ -2216,12 +2250,12 @@ async function startServer() {
       removed.id,
       `Evento eliminado: ${removed.title} (${removedOrders.length} órdenes y ${removedTicketsCount} tickets depurados)`
     );
-    persistDb();
+    await persistDb();
     res.json({ ok: true, deletedId: removed.id });
   });
 
   // Dynamic Season Categories & Special Campaigns (Module 2.1)
-  app.post('/api/admin/seasons', requirePermission('special_events', 'events'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/seasons', requirePermission('special_events', 'events'), async (req: AuthedRequest, res: Response) => {
     const seasonName = String(req.body?.name || '').trim().slice(0, 60);
     if (!seasonName) {
       res.status(400).json({ error: 'Escribe el nombre de la categoría o temporada.' });
@@ -2230,12 +2264,12 @@ async function startServer() {
     if (!db.seasons.some((s) => s.toLowerCase() === seasonName.toLowerCase())) {
       db.seasons.push(seasonName);
       appendAudit(req.user!, 'CREATE_SEASON', 'season', seasonName, `Nueva categoría especial: ${seasonName}`);
-      persistDb();
+      await persistDb();
     }
     res.json({ seasons: db.seasons });
   });
 
-  app.post('/api/admin/campaigns', requirePermission('special_events'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/campaigns', requirePermission('special_events'), async (req: AuthedRequest, res: Response) => {
     const b = req.body || {};
     const name = String(b.name || '').trim();
     if (!name) {
@@ -2267,11 +2301,11 @@ async function startServer() {
 
     db.specialCampaigns.unshift(camp);
     appendAudit(req.user!, 'CREATE_CAMPAIGN', 'campaign', camp.id, `Campaña creada: ${camp.name} (${camp.season})`);
-    persistDb();
+    await persistDb();
     res.json({ campaign: camp });
   });
 
-  app.put('/api/admin/campaigns/:id', requirePermission('special_events'), (req: AuthedRequest, res: Response) => {
+  app.put('/api/admin/campaigns/:id', requirePermission('special_events'), async (req: AuthedRequest, res: Response) => {
     const camp = db.specialCampaigns.find((c) => c.id === req.params.id);
     if (!camp) {
       res.status(404).json({ error: 'Campaña no encontrada.' });
@@ -2301,11 +2335,11 @@ async function startServer() {
     }
 
     appendAudit(req.user!, 'UPDATE_CAMPAIGN', 'campaign', camp.id, `Campaña actualizada: ${camp.name}`);
-    persistDb();
+    await persistDb();
     res.json({ campaign: camp });
   });
 
-  app.delete('/api/admin/campaigns/:id', requirePermission('special_events'), (req: AuthedRequest, res: Response) => {
+  app.delete('/api/admin/campaigns/:id', requirePermission('special_events'), async (req: AuthedRequest, res: Response) => {
     const idx = db.specialCampaigns.findIndex((c) => c.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Campaña no encontrada.' });
@@ -2318,7 +2352,7 @@ async function startServer() {
       }
     });
     appendAudit(req.user!, 'DELETE_CAMPAIGN', 'campaign', removed.id, `Campaña eliminada: ${removed.name}`);
-    persistDb();
+    await persistDb();
     res.json({ ok: true, deletedId: removed.id });
   });
 
@@ -2328,7 +2362,7 @@ async function startServer() {
   app.put(
     '/api/admin/payment-methods',
     requirePermission('payment_methods'),
-    (req: AuthedRequest, res: Response) => {
+    async (req: AuthedRequest, res: Response) => {
       const b = req.body || {};
       if (b.pago_movil) {
         db.paymentMethods.pago_movil = {
@@ -2383,7 +2417,7 @@ async function startServer() {
         'global',
         `Métodos actualizados (PagoMóvil:${db.paymentMethods.pago_movil.enabled}, Transf:${db.paymentMethods.transferencia.enabled}, Binance:${db.paymentMethods.binance.enabled}, Tasa:${db.exchangeRate?.rate} Bs)`
       );
-      persistDb();
+      await persistDb();
       res.json({ paymentMethods: { ...db.paymentMethods, exchangeRate: db.exchangeRate }, exchangeRate: db.exchangeRate });
     }
   );
@@ -2403,7 +2437,7 @@ async function startServer() {
   // =========================================================
   // MODULE 4 & 5: ORDERS, PRIVATE VOUCHERS, APPROVAL & QR ISSUANCE
   // =========================================================
-  app.post('/api/orders', requireAuth, (req: AuthedRequest, res: Response) => {
+  app.post('/api/orders', requireAuth, async (req: AuthedRequest, res: Response) => {
     const u = req.user!;
     const {
       eventId,
@@ -2556,26 +2590,16 @@ async function startServer() {
     const now = new Date().toISOString();
     const orderId = `ORD-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
 
-    // Store voucher in private server storage — NEVER exposed in public URLs!
-    const voucherPath = path.join(VOUCHERS_DIR, `${orderId}.json`);
-    try {
-      fs.writeFileSync(
-        voucherPath,
-        JSON.stringify({
-          orderId,
-          userId: u.id,
-          eventId: ev.id,
-          paymentMethod: method,
-          reference: cleanRef,
-          uploadedAt: now,
-          dataUrl: rawVoucher,
-        }),
-        { mode: 0o600 }
-      );
-    } catch (writeErr) {
-      console.warn('Warning: Falling back to memory voucher storage:', writeErr);
-      memoryVouchers.set(orderId, { dataUrl: rawVoucher, uploadedAt: now });
-    }
+    // Store voucher in private PostgreSQL table — NEVER exposed in public URLs!
+    await saveVoucherToPostgres({
+      orderId,
+      userId: u.id,
+      eventId: ev.id,
+      paymentMethod: method,
+      reference: cleanRef,
+      uploadedAt: now,
+      dataUrl: rawVoucher,
+    });
 
     const newOrder = {
       id: orderId,
@@ -2608,8 +2632,6 @@ async function startServer() {
     };
 
     db.orders.unshift(newOrder);
-    persistDb();
-
     recordSecurityAudit(
       'ORDER_PAYMENT_REPORTED',
       'info',
@@ -2617,16 +2639,26 @@ async function startServer() {
       `Orden ${newOrder.id} (${newOrder.ticketType.toUpperCase()} x${newOrder.qty}) registrada · Ref: ${cleanRef} · Total: $${newOrder.totalAmount} · Método: ${method}`,
       u.email
     );
+    await persistDb();
 
     res.json({ order: newOrder });
   });
 
-  // Protected Private Voucher Endpoint (Test #10 of Phase 6!)
+  // Protected Private Voucher Endpoint (Backed by PostgreSQL vouchers table)
   app.get(
     '/api/admin/orders/:id/voucher',
     requirePermission('pending_vouchers', 'orders_payments'),
-    (req: AuthedRequest, res: Response) => {
+    async (req: AuthedRequest, res: Response) => {
       const orderId = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+      try {
+        const pgVoucher = await getVoucherFromPostgres(orderId);
+        if (pgVoucher) {
+          res.json({ orderId, dataUrl: pgVoucher.dataUrl, uploadedAt: pgVoucher.uploadedAt });
+          return;
+        }
+      } catch (pgErr) {
+        console.warn('Warning: Error reading voucher from PostgreSQL:', pgErr);
+      }
       const voucherPath = path.join(VOUCHERS_DIR, `${orderId}.json`);
       try {
         if (fs.existsSync(voucherPath)) {
@@ -2650,7 +2682,7 @@ async function startServer() {
   app.post(
     '/api/admin/orders/:id/approve',
     requirePermission('pending_vouchers', 'orders_payments'),
-    (req: AuthedRequest, res: Response) => {
+    async (req: AuthedRequest, res: Response) => {
       const order = db.orders.find((o) => o.id === req.params.id);
       if (!order) {
         res.status(404).json({ error: 'Orden no encontrada.' });
@@ -2737,7 +2769,7 @@ async function startServer() {
         order.id,
         `Pago aprobado ($${order.totalAmount}) · Emitidos ${issuedTickets.length} QR únicos`
       );
-      persistDb();
+      await persistDb();
       res.json({ order, issuedTickets });
     }
   );
@@ -2745,7 +2777,7 @@ async function startServer() {
   app.post(
     '/api/admin/orders/:id/reject',
     requirePermission('pending_vouchers', 'orders_payments'),
-    (req: AuthedRequest, res: Response) => {
+    async (req: AuthedRequest, res: Response) => {
       const order = db.orders.find((o) => o.id === req.params.id);
       if (!order) {
         res.status(404).json({ error: 'Orden no encontrada.' });
@@ -2765,7 +2797,7 @@ async function startServer() {
       order.updatedAt = now;
 
       appendAudit(req.user!, 'REJECT_PAYMENT', 'order', order.id, `Pago rechazado: ${order.reviewNotes}`);
-      persistDb();
+      await persistDb();
       res.json({ order });
     }
   );
@@ -2773,7 +2805,7 @@ async function startServer() {
   app.post(
     '/api/admin/orders/:id/refund',
     requirePermission('orders_payments'),
-    (req: AuthedRequest, res: Response) => {
+    async (req: AuthedRequest, res: Response) => {
       const order = db.orders.find((o) => o.id === req.params.id);
       if (!order || order.status !== 'approved') {
         res.status(400).json({ error: 'Solo se pueden reembolsar órdenes previamente aprobadas.' });
@@ -2791,7 +2823,7 @@ async function startServer() {
         });
 
       appendAudit(req.user!, 'REFUND_ORDER', 'order', order.id, `Orden reembolsada ($${order.totalAmount})`);
-      persistDb();
+      await persistDb();
       res.json({ order });
     }
   );
@@ -2973,7 +3005,7 @@ async function startServer() {
         };
 
         db.tickets.unshift(ticket);
-        persistDb();
+        await persistDb();
       }
 
       if (!ticket) {
@@ -3069,7 +3101,7 @@ async function startServer() {
         ticket.id,
         `Envío de entrada ${ticket.code} a ${recipientEmail} (${sentRealSmtp ? 'SMTP Real' : 'Simulación'})`
       );
-      persistDb();
+      await persistDb();
 
       res.json({
         ok: true,
@@ -3097,7 +3129,7 @@ async function startServer() {
       const now = new Date().toISOString();
       const check = verifyTicketQrPayload(rawCode, db);
 
-      const recordAccess = (
+      const recordAccess = async (
         result: string,
         message: string,
         tk?: any
@@ -3120,14 +3152,14 @@ async function startServer() {
         if (validatorActor) {
           appendAudit(validatorActor, 'VALIDATE_QR', 'ticket', entry.ticketCode, `${result}: ${message}`);
         }
-        persistDb();
+        await persistDb();
         return entry;
       };
 
       if (!check.validFormat || !check.ticket) {
         outcome = {
           allowed: false,
-          log: recordAccess('NO_EXISTE', 'El código escaneado no corresponde a ningún ticket emitido.'),
+          log: await recordAccess('NO_EXISTE', 'El código escaneado no corresponde a ningún ticket emitido.'),
         };
         return;
       }
@@ -3135,7 +3167,7 @@ async function startServer() {
       if (!check.signatureValid) {
         outcome = {
           allowed: false,
-          log: recordAccess('FIRMA_INVALIDA', 'Firma criptográfica inválida o código adulterado.', check.ticket),
+          log: await recordAccess('FIRMA_INVALIDA', 'Firma criptográfica inválida o código adulterado.', check.ticket),
         };
         return;
       }
@@ -3144,7 +3176,7 @@ async function startServer() {
       if (eventFilterId && tk.eventId !== eventFilterId) {
         outcome = {
           allowed: false,
-          log: recordAccess(
+          log: await recordAccess(
             'EVENTO_NO_VIGENTE',
             `Este ticket pertenece a otro evento (${tk.eventTitle}).`,
             tk
@@ -3158,7 +3190,7 @@ async function startServer() {
       if ((!parentOrder && !isDemoOrder) || (parentOrder && parentOrder.status !== 'approved')) {
         outcome = {
           allowed: false,
-          log: recordAccess('PAGO_NO_APROBADO', 'La orden asociada no tiene un pago confirmado.', tk),
+          log: await recordAccess('PAGO_NO_APROBADO', 'La orden asociada no tiene un pago confirmado.', tk),
         };
         return;
       }
@@ -3167,7 +3199,7 @@ async function startServer() {
       if (!ev || ev.status === 'archived') {
         outcome = {
           allowed: false,
-          log: recordAccess('EVENTO_NO_VIGENTE', 'El evento asociado ya fue archivado o no está activo.', tk),
+          log: await recordAccess('EVENTO_NO_VIGENTE', 'El evento asociado ya fue archivado o no está activo.', tk),
         };
         return;
       }
@@ -3175,7 +3207,7 @@ async function startServer() {
       if (tk.status === 'used') {
         outcome = {
           allowed: false,
-          log: recordAccess(
+          log: await recordAccess(
             'YA_UTILIZADA',
             `Acceso denegado: ya ingresó el ${tk.usedAt ? new Date(tk.usedAt).toLocaleString('es-VE') : 'anteriormente'}.`,
             tk
@@ -3187,7 +3219,7 @@ async function startServer() {
       if (tk.status !== 'valid') {
         outcome = {
           allowed: false,
-          log: recordAccess('TICKET_REVOCADO', `Ticket en estado ${tk.status}.`, tk),
+          log: await recordAccess('TICKET_REVOCADO', `Ticket en estado ${tk.status}.`, tk),
         };
         return;
       }
@@ -3197,7 +3229,7 @@ async function startServer() {
       tk.usedAt = now;
       tk.validatedBy = validatorName;
 
-      const log = recordAccess(
+      const log = await recordAccess(
         'ENTRADA_VALIDA',
         `Acceso autorizado · ${tk.ticketType.toUpperCase()} · Titular: ${tk.userName}`,
         tk
@@ -3452,7 +3484,7 @@ async function startServer() {
         ev.id,
         `${kind} · Elegibles:${eligible.length} · Estado:${status}`
       );
-      persistDb();
+      await persistDb();
       res.json({ log: logEntry });
     }
   );
@@ -3460,7 +3492,7 @@ async function startServer() {
   // =========================================================
   // MODULE 9: STAFF, ROLES & GRANULAR PERMISSIONS (Anti Self-Elevation)
   // =========================================================
-  app.post('/api/admin/staff', requirePermission('staff_rbac'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/staff', requirePermission('staff_rbac'), async (req: AuthedRequest, res: Response) => {
     if (req.user!.role !== 'super_admin') {
       res.status(403).json({ error: 'Solo el Administrador Principal puede crear cuentas de personal.' });
       return;
@@ -3527,11 +3559,11 @@ async function startServer() {
       staffUser.id,
       `Personal creado: ${staffUser.email} con rol ${assignedRole}`
     );
-    persistDb();
+    await persistDb();
     res.json({ ok: true });
   });
 
-  app.put('/api/admin/staff/:id/permissions', requirePermission('staff_rbac'), (req: AuthedRequest, res: Response) => {
+  app.put('/api/admin/staff/:id/permissions', requirePermission('staff_rbac'), async (req: AuthedRequest, res: Response) => {
     if (req.user!.role !== 'super_admin') {
       res.status(403).json({ error: 'Solo el Administrador Principal puede modificar roles y permisos.' });
       return;
@@ -3575,11 +3607,11 @@ async function startServer() {
       target.id,
       `Actualizado rol=${target.role} para ${target.email}`
     );
-    persistDb();
+    await persistDb();
     res.json({ ok: true });
   });
 
-  app.post('/api/admin/users/:id/block', requirePermission('users', 'staff_rbac'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/users/:id/block', requirePermission('users', 'staff_rbac'), async (req: AuthedRequest, res: Response) => {
     const target = db.users.find((u) => u.id === req.params.id);
     if (!target || target.id === req.user!.id) {
       res.status(400).json({ error: 'Operación no permitida sobre este usuario.' });
@@ -3600,14 +3632,14 @@ async function startServer() {
       target.id,
       `${target.blocked ? 'Bloqueado' : 'Desbloqueado'}: ${target.email}`
     );
-    persistDb();
+    await persistDb();
     res.json({ blocked: target.blocked });
   });
 
   // =========================================================
   // PROMOTIONS, FLYERS & GALLERY (Modules 2 & 10)
   // =========================================================
-  app.post('/api/admin/promotions', requirePermission('promos_flyers'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/promotions', requirePermission('promos_flyers'), async (req: AuthedRequest, res: Response) => {
     const b = req.body || {};
     const title = String(b.title || '').trim();
     if (!title) {
@@ -3646,11 +3678,11 @@ async function startServer() {
     };
     db.promotions.unshift(promo);
     appendAudit(req.user!, 'CREATE_PROMO', 'promo', promo.id, `Publicidad creada: ${promo.title} (${adFormat})`);
-    persistDb();
+    await persistDb();
     res.json({ promo });
   });
 
-  app.put('/api/admin/promotions/:id', requirePermission('promos_flyers'), (req: AuthedRequest, res: Response) => {
+  app.put('/api/admin/promotions/:id', requirePermission('promos_flyers'), async (req: AuthedRequest, res: Response) => {
     const promo = db.promotions.find((p) => p.id === req.params.id);
     if (!promo) {
       res.status(404).json({ error: 'Anuncio no encontrado.' });
@@ -3680,18 +3712,18 @@ async function startServer() {
       promo.tribute = Boolean(b.tribute);
       if (promo.tribute) promo.adFormat = 'tribute';
     }
-    persistDb();
+    await persistDb();
     res.json({ promo });
   });
 
-  app.delete('/api/admin/promotions/:id', requirePermission('promos_flyers'), (req: AuthedRequest, res: Response) => {
+  app.delete('/api/admin/promotions/:id', requirePermission('promos_flyers'), async (req: AuthedRequest, res: Response) => {
     db.promotions = db.promotions.filter((p) => p.id !== req.params.id);
-    persistDb();
+    await persistDb();
     res.json({ ok: true });
   });
 
   // Public Validated Advertiser / Brand Sponsorship Lead Capture
-  app.post('/api/ad-inquiries', (req: Request, res: Response) => {
+  app.post('/api/ad-inquiries', async (req: Request, res: Response) => {
     const b = req.body || {};
     const brandName = String(b.brandName || '').trim().slice(0, 80);
     const contactName = String(b.contactName || '').trim().slice(0, 80);
@@ -3726,19 +3758,19 @@ async function startServer() {
     };
     db.adInquiries.unshift(inquiry);
     if (db.adInquiries.length > 200) db.adInquiries.length = 200;
-    persistDb();
+    await persistDb();
     res.json({ ok: true, inquiryId: inquiry.id });
   });
 
-  app.delete('/api/admin/ad-inquiries/:id', requirePermission('promos_flyers'), (req: AuthedRequest, res: Response) => {
+  app.delete('/api/admin/ad-inquiries/:id', requirePermission('promos_flyers'), async (req: AuthedRequest, res: Response) => {
     if (Array.isArray(db.adInquiries)) {
       db.adInquiries = db.adInquiries.filter((q) => q.id !== req.params.id);
-      persistDb();
+      await persistDb();
     }
     res.json({ ok: true });
   });
 
-  app.post('/api/admin/gallery/categories', requirePermission('gallery_admin'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/gallery/categories', requirePermission('gallery_admin'), async (req: AuthedRequest, res: Response) => {
     const name = String(req.body?.name || '').trim().slice(0, 50);
     if (!name) {
       res.status(400).json({ error: 'Escribe el nombre de la categoría.' });
@@ -3752,12 +3784,12 @@ async function startServer() {
         slug,
         order: db.galleryCategories.length + 1,
       });
-      persistDb();
+      await persistDb();
     }
     res.json({ categories: db.galleryCategories });
   });
 
-  app.post('/api/admin/gallery/photos', requirePermission('gallery_admin'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/gallery/photos', requirePermission('gallery_admin'), async (req: AuthedRequest, res: Response) => {
     const b = req.body || {};
     const title = String(b.title || '').trim();
     if (!title) {
@@ -3780,11 +3812,11 @@ async function startServer() {
     };
     db.galleryPhotos.unshift(photo);
     appendAudit(req.user!, 'CREATE_GALLERY_PHOTO', 'gallery', photo.id, `Fotografía publicada: ${photo.title}`);
-    persistDb();
+    await persistDb();
     res.json({ photo });
   });
 
-  app.put('/api/admin/gallery/photos/:id', requirePermission('gallery_admin'), (req: AuthedRequest, res: Response) => {
+  app.put('/api/admin/gallery/photos/:id', requirePermission('gallery_admin'), async (req: AuthedRequest, res: Response) => {
     const photo = db.galleryPhotos.find((g) => g.id === req.params.id);
     if (!photo) {
       res.status(404).json({ error: 'Fotografía no encontrada.' });
@@ -3796,20 +3828,20 @@ async function startServer() {
     if (b.description !== undefined) photo.description = String(b.description).slice(0, 300);
     if (b.categoryId !== undefined) photo.categoryId = String(b.categoryId);
     if (b.eventId !== undefined) photo.eventId = String(b.eventId);
-    persistDb();
+    await persistDb();
     res.json({ photo });
   });
 
-  app.delete('/api/admin/gallery/photos/:id', requirePermission('gallery_admin'), (req: AuthedRequest, res: Response) => {
+  app.delete('/api/admin/gallery/photos/:id', requirePermission('gallery_admin'), async (req: AuthedRequest, res: Response) => {
     db.galleryPhotos = db.galleryPhotos.filter((g) => g.id !== req.params.id);
-    persistDb();
+    await persistDb();
     res.json({ ok: true });
   });
 
   // =========================================================
   // SETTINGS
   // =========================================================
-  app.put('/api/admin/settings', requirePermission('settings'), (req: AuthedRequest, res: Response) => {
+  app.put('/api/admin/settings', requirePermission('settings'), async (req: AuthedRequest, res: Response) => {
     const b = req.body || {};
     db.settings = {
       brandHandle: String(b.brandHandle ?? db.settings.brandHandle).slice(0, 50),
@@ -3823,36 +3855,23 @@ async function startServer() {
       emailNotificationsEnabled: Boolean(b.emailNotificationsEnabled ?? db.settings.emailNotificationsEnabled),
     };
     appendAudit(req.user!, 'UPDATE_SETTINGS', 'settings', 'global', 'Configuración general actualizada');
-    persistDb();
+    await persistDb();
     res.json({ settings: db.settings });
   });
 
   // =========================================================
-  // SYSTEM BACKUP & MEMORY RESTORATION
+  // SYSTEM BACKUP & MEMORY RESTORATION (PostgreSQL)
   // =========================================================
-  app.get('/api/admin/backup/export', requirePermission('settings'), (req: AuthedRequest, res: Response) => {
-    const backupSnapshot = {
-      version: '2026.1',
-      exportedAt: new Date().toISOString(),
-      platform: 'La Vuelta Sessions',
-      events: db.events,
-      specialCampaigns: db.specialCampaigns,
-      seasons: db.seasons,
-      paymentMethods: db.paymentMethods,
-      orders: db.orders,
-      tickets: db.tickets,
-      promotions: db.promotions,
-      galleryCategories: db.galleryCategories,
-      galleryPhotos: db.galleryPhotos,
-      settings: db.settings,
-    };
-    recordSecurityAudit('BACKUP_EXPORTED', 'info', req, 'Copia de seguridad completa descargada por administrador.', req.user!.email);
+  app.get('/api/admin/backup/export', requirePermission('settings'), async (req: AuthedRequest, res: Response) => {
+    recordSecurityAudit('BACKUP_EXPORTED', 'info', req, 'Copia de seguridad completa de PostgreSQL descargada por administrador.', req.user!.email);
+    await persistDb();
+    const backupSnapshot = await exportFullPostgresBackup(db);
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="lavuelta_backup_${new Date().toISOString().slice(0, 10)}.json"`);
+    res.setHeader('Content-Disposition', `attachment; filename="lavuelta_pg_backup_${new Date().toISOString().slice(0, 10)}.json"`);
     res.send(JSON.stringify(backupSnapshot, null, 2));
   });
 
-  app.post('/api/admin/backup/restore', requirePermission('settings'), (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/backup/restore', requirePermission('settings'), async (req: AuthedRequest, res: Response) => {
     const { backupData } = req.body || {};
     if (!backupData || typeof backupData !== 'object') {
       res.status(400).json({ error: 'Archivo de respaldo inválido o vacío.' });
@@ -3863,6 +3882,8 @@ async function startServer() {
       return;
     }
 
+    if (Array.isArray(backupData.users)) db.users = backupData.users;
+    if (Array.isArray(backupData.sessions)) db.sessions = backupData.sessions;
     if (Array.isArray(backupData.events)) db.events = backupData.events;
     if (Array.isArray(backupData.specialCampaigns)) db.specialCampaigns = backupData.specialCampaigns;
     if (Array.isArray(backupData.seasons)) db.seasons = backupData.seasons;
@@ -3871,16 +3892,25 @@ async function startServer() {
     }
     if (Array.isArray(backupData.orders)) db.orders = backupData.orders;
     if (Array.isArray(backupData.tickets)) db.tickets = backupData.tickets;
+    if (Array.isArray(backupData.accessLogs)) db.accessLogs = backupData.accessLogs;
     if (Array.isArray(backupData.promotions)) db.promotions = backupData.promotions;
+    if (Array.isArray(backupData.adInquiries)) db.adInquiries = backupData.adInquiries;
     if (Array.isArray(backupData.galleryCategories)) db.galleryCategories = backupData.galleryCategories;
     if (Array.isArray(backupData.galleryPhotos)) db.galleryPhotos = backupData.galleryPhotos;
+    if (Array.isArray(backupData.notificationLogs)) db.notificationLogs = backupData.notificationLogs;
+    if (Array.isArray(backupData.sentNotificationKeys)) db.sentNotificationKeys = backupData.sentNotificationKeys;
+    if (Array.isArray(backupData.auditLogs)) db.auditLogs = backupData.auditLogs;
+    if (Array.isArray(backupData.securityAuditLogs)) db.securityAuditLogs = backupData.securityAuditLogs;
     if (backupData.settings && typeof backupData.settings === 'object') {
       db.settings = { ...db.settings, ...backupData.settings };
     }
+    if (backupData.exchangeRate && typeof backupData.exchangeRate === 'object') {
+      db.exchangeRate = { ...db.exchangeRate, ...backupData.exchangeRate };
+    }
 
-    persistDb();
-    recordSecurityAudit('BACKUP_RESTORED', 'warning', req, `Sistema restaurado desde copia de seguridad (Exportada: ${backupData.exportedAt || 'Fecha desconocida'}).`, req.user!.email);
-    res.json({ ok: true, message: '¡Copia de seguridad restaurada con éxito! Todos los datos fueron reestablecidos.' });
+    recordSecurityAudit('BACKUP_RESTORED', 'warning', req, `Sistema PostgreSQL restaurado desde copia de seguridad (Exportada: ${backupData.exportedAt || 'Fecha desconocida'}).`, req.user!.email);
+    await enqueuePostgresPersist(db, Array.isArray(backupData.vouchers) ? backupData.vouchers : []);
+    res.json({ ok: true, message: '¡Copia de seguridad restaurada con éxito en PostgreSQL! Todos los datos y comprobantes fueron reestablecidos.' });
   });
 
   // =========================================================
@@ -3925,9 +3955,19 @@ async function startServer() {
     }
   });
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LA VUELTA SESSIONS server listening on http://0.0.0.0:${PORT} (mode=${IS_PROD ? 'production' : 'development'})`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`LA VUELTA SESSIONS server listening on http://0.0.0.0:${PORT} (mode=${IS_PROD ? 'production' : 'development'}, storage=PostgreSQL)`);
   });
+
+  const shutdown = async (signal: string) => {
+    console.log(`[Server] Received ${signal}. Closing HTTP server and PostgreSQL pool...`);
+    server.close(async () => {
+      await closePgPool();
+      process.exit(0);
+    });
+  };
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
 }
 
 startServer().catch((err) => {
