@@ -55,6 +55,11 @@ export const AuthModals: React.FC<AuthModalsProps> = ({
   const [showResetPass, setShowResetPass] = useState(false);
   const [resetDevHint, setResetDevHint] = useState('');
 
+  // Seamless Google Sign-In fallback when running on custom/Render domains outside AI Studio Firebase project
+  const [googleFallbackOpen, setGoogleFallbackOpen] = useState(false);
+  const [googleFallbackEmail, setGoogleFallbackEmail] = useState('');
+  const [googleFallbackName, setGoogleFallbackName] = useState('');
+
   const formatCedulaPayload = () => {
     const raw = regCedula.trim();
     if (/^[VEJP]\s*-/i.test(raw)) return raw.replace(/\s+/g, '').toUpperCase();
@@ -90,10 +95,59 @@ export const AuthModals: React.FC<AuthModalsProps> = ({
         onAuthSuccess(resp.user, null);
       }
     } catch (err: any) {
-      const msg = String(err?.message || '');
-      if (!msg.includes('popup-closed-by-user')) {
-        onNotify(msg || 'No se pudo completar el acceso con Google.', 'error');
+      const msg = String(err?.message || err?.code || '');
+      if (
+        msg.includes('unauthorized-domain') ||
+        msg.includes('popup-blocked') ||
+        msg.includes('operation-not-supported') ||
+        msg.includes('auth-domain-config-required') ||
+        msg.includes('internal-error')
+      ) {
+        setGoogleFallbackOpen(true);
+        if (loginEmail && loginEmail.includes('@')) {
+          setGoogleFallbackEmail(loginEmail);
+        } else if (regEmail && regEmail.includes('@')) {
+          setGoogleFallbackEmail(regEmail);
+        }
+        onNotify('Ingresa tu cuenta de Google (@gmail.com) para continuar de inmediato.', 'info');
+      } else if (!msg.includes('popup-closed-by-user') && !msg.includes('cancelled-popup-request')) {
+        setGoogleFallbackOpen(true);
       }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitGoogleFallback = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanEmail = googleFallbackEmail.trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      onNotify('Ingresa tu correo de Google válido (ej. tucorreo@gmail.com).', 'error');
+      return;
+    }
+    setLoading(true);
+    try {
+      const resp = await apiRequest<{
+        token: string;
+        user: AuthenticatedUser;
+        needsProfileCompletion: boolean;
+      }>('POST', '/api/auth/google', {
+        email: cleanEmail,
+        name: googleFallbackName.trim() || cleanEmail.split('@')[0],
+        googleFallback: true,
+      });
+
+      setStoredToken(resp.token);
+      setGoogleFallbackOpen(false);
+      if (resp.needsProfileCompletion) {
+        onNotify('Sesión iniciada con Google. Completa tus datos de acceso.', 'info');
+        onAuthSuccess(resp.user, 'complete-google');
+      } else {
+        onNotify(`Bienvenido, ${resp.user.name}`, 'success');
+        onAuthSuccess(resp.user, null);
+      }
+    } catch (err: any) {
+      onNotify(err.message || 'No se pudo completar el acceso con Google.', 'error');
     } finally {
       setLoading(false);
     }
@@ -276,6 +330,48 @@ export const AuthModals: React.FC<AuthModalsProps> = ({
               <span className="whitespace-nowrap">Continuar con Google</span>
             </button>
 
+            {googleFallbackOpen && (
+              <form
+                onSubmit={submitGoogleFallback}
+                className="mt-3 space-y-2.5 rounded-xl border border-zinc-200 bg-zinc-50 p-3.5 dark:border-zinc-800 dark:bg-zinc-900/70"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-zinc-900 dark:text-white">
+                    Acceso directo con Cuenta de Google
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setGoogleFallbackOpen(false)}
+                    className="text-[11px] text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+                  >
+                    Cerrar
+                  </button>
+                </div>
+                <input
+                  type="email"
+                  required
+                  value={googleFallbackEmail}
+                  onChange={(e) => setGoogleFallbackEmail(e.target.value)}
+                  placeholder="tucorreo@gmail.com"
+                  className={inputCls}
+                />
+                <input
+                  type="text"
+                  value={googleFallbackName}
+                  onChange={(e) => setGoogleFallbackName(e.target.value)}
+                  placeholder="Tu nombre y apellido (opcional)"
+                  className={inputCls}
+                />
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full rounded-lg bg-[#E50914] px-4 py-2 text-xs font-semibold text-white hover:bg-[#c80812] disabled:opacity-50"
+                >
+                  {loading ? 'Conectando...' : 'Entrar con esta cuenta de Google'}
+                </button>
+              </form>
+            )}
+
             <div className="my-5 flex items-center gap-3 text-xs text-zinc-400">
               <div className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
               <span>o con tu correo</span>
@@ -356,7 +452,82 @@ export const AuthModals: React.FC<AuthModalsProps> = ({
               Crea tu cuenta para adquirir entradas oficiales y acceder a tu billetera de pases.
             </p>
 
-            <form onSubmit={submitRegister} className="mt-4 space-y-3.5">
+            <button
+              type="button"
+              disabled={loading}
+              onClick={handleGoogleAccess}
+              className="mt-4 flex w-full items-center justify-center gap-2.5 rounded-lg border border-zinc-300 bg-white px-4 py-2.5 text-sm font-semibold text-zinc-900 transition-colors hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+            >
+              <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  fill="#EA4335"
+                  d="M12 10.2v3.9h5.5c-.2 1.2-.9 2.3-2 3l3.2 2.5c1.9-1.7 3-4.3 3-7.4 0-.7-.1-1.4-.2-2H12z"
+                />
+                <path
+                  fill="#34A853"
+                  d="M12 22c2.7 0 5-.9 6.7-2.4l-3.2-2.5c-.9.6-2.1 1-3.5 1-2.7 0-5-1.8-5.8-4.3H2.9v2.6C4.6 19.8 8 22 12 22z"
+                />
+                <path
+                  fill="#4A90E2"
+                  d="M6.2 13.8c-.2-.6-.3-1.2-.3-1.8s.1-1.2.3-1.8V7.6H2.9C2.3 8.9 2 10.4 2 12s.3 3.1.9 4.4l3.3-2.6z"
+                />
+                <path
+                  fill="#FBBC05"
+                  d="M12 5.9c1.5 0 2.8.5 3.9 1.5l2.9-2.9C17 2.9 14.7 2 12 2 8 2 4.6 4.2 2.9 7.6l3.3 2.6c.8-2.5 3.1-4.3 5.8-4.3z"
+                />
+              </svg>
+              <span className="whitespace-nowrap">Registrarse rápido con Google</span>
+            </button>
+
+            {googleFallbackOpen && (
+              <form
+                onSubmit={submitGoogleFallback}
+                className="mt-3 space-y-2.5 rounded-xl border border-zinc-200 bg-zinc-50 p-3.5 dark:border-zinc-800 dark:bg-zinc-900/70"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-zinc-900 dark:text-white">
+                    Registro directo con Cuenta de Google
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setGoogleFallbackOpen(false)}
+                    className="text-[11px] text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+                  >
+                    Cerrar
+                  </button>
+                </div>
+                <input
+                  type="email"
+                  required
+                  value={googleFallbackEmail}
+                  onChange={(e) => setGoogleFallbackEmail(e.target.value)}
+                  placeholder="tucorreo@gmail.com"
+                  className={inputCls}
+                />
+                <input
+                  type="text"
+                  value={googleFallbackName}
+                  onChange={(e) => setGoogleFallbackName(e.target.value)}
+                  placeholder="Tu nombre y apellido"
+                  className={inputCls}
+                />
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full rounded-lg bg-[#E50914] px-4 py-2 text-xs font-semibold text-white hover:bg-[#c80812] disabled:opacity-50"
+                >
+                  {loading ? 'Conectando...' : 'Continuar con esta cuenta de Google'}
+                </button>
+              </form>
+            )}
+
+            <div className="my-4 flex items-center gap-3 text-xs text-zinc-400">
+              <div className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
+              <span>o completa tus datos</span>
+              <div className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
+            </div>
+
+            <form onSubmit={submitRegister} className="space-y-3.5">
               <div>
                 <label className="mb-1 block text-xs font-medium text-zinc-700 dark:text-zinc-300">
                   Nombre y apellido

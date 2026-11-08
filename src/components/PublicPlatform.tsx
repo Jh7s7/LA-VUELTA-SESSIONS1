@@ -267,6 +267,47 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
     qty: number;
     email: string;
   } | null>(null);
+  const [sendingWalletTicketId, setSendingWalletTicketId] = useState<string | null>(null);
+  const [walletEmailPreview, setWalletEmailPreview] = useState<{
+    recipient: string;
+    ticketCode: string;
+    emailHtml: string;
+    sentRealSmtp?: boolean;
+  } | null>(null);
+
+  const sendBuyerTicketEmail = async (ticketId: string) => {
+    setSendingWalletTicketId(ticketId);
+    try {
+      const resp = await apiRequest<{
+        ok: boolean;
+        sentRealSmtp?: boolean;
+        recipient: string;
+        ticketCode: string;
+        emailHtml?: string;
+      }>('POST', '/api/tickets/resend', {
+        ticketId,
+        email: currentUser?.email,
+      });
+      if (resp.emailHtml) {
+        setWalletEmailPreview({
+          recipient: resp.recipient,
+          ticketCode: resp.ticketCode,
+          emailHtml: resp.emailHtml,
+          sentRealSmtp: resp.sentRealSmtp,
+        });
+      }
+      onNotify(
+        resp.sentRealSmtp
+          ? `Entrada ${resp.ticketCode} enviada a ${resp.recipient}.`
+          : `Pase digital ${resp.ticketCode} generado para ${resp.recipient}.`,
+        'success'
+      );
+    } catch (err: any) {
+      onNotify(err.message || 'No se pudo enviar el pase al correo.', 'error');
+    } finally {
+      setSendingWalletTicketId(null);
+    }
+  };
 
   // Gallery Filter & Lightbox State (Module 10)
   const [galCategoryFilter, setGalCategoryFilter] = useState('');
@@ -3134,17 +3175,63 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
                               Titular: {t.userName}
                             </p>
                           </div>
-                          <div className="mt-4 border-t border-zinc-200/80 pt-3 dark:border-white/[0.08]">
-                            <span className="block text-[10px] text-zinc-400">
-                              Código de verificación
-                            </span>
-                            <span className="font-mono-tabular text-xs font-semibold text-zinc-900 dark:text-zinc-200">
-                              {t.code}
-                            </span>
+                          <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-200/80 pt-3 dark:border-white/[0.08]">
+                            <div>
+                              <span className="block text-[10px] text-zinc-400">
+                                Código de verificación
+                              </span>
+                              <span className="font-mono-tabular text-xs font-semibold text-zinc-900 dark:text-zinc-200">
+                                {t.code}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={sendingWalletTicketId === t.id}
+                              onClick={() => sendBuyerTicketEmail(t.id)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 bg-zinc-50 px-3 py-1.5 text-[11px] font-semibold text-zinc-800 hover:bg-zinc-100 disabled:opacity-50 dark:border-white/15 dark:bg-white/[0.05] dark:text-white dark:hover:bg-white/10"
+                            >
+                              <span>
+                                {sendingWalletTicketId === t.id
+                                  ? 'Enviando...'
+                                  : 'Enviar a mi Correo'}
+                              </span>
+                            </button>
                           </div>
                         </div>
                       </motion.div>
                     ))}
+                  </div>
+                )}
+
+                {walletEmailPreview && (
+                  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
+                    <div className="relative flex h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950">
+                      <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
+                        <div>
+                          <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
+                            Pase Digital Enviado al Correo · {walletEmailPreview.ticketCode}
+                          </h3>
+                          <p className="text-[11px] text-zinc-500">
+                            Destinatario: {walletEmailPreview.recipient}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setWalletEmailPreview(null)}
+                          className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+                        >
+                          <X className="h-5 w-5" />
+                        </button>
+                      </div>
+                      <div className="flex-1 overflow-hidden bg-zinc-900 p-2">
+                        <iframe
+                          title="Vista Previa de Entrada por Correo"
+                          srcDoc={walletEmailPreview.emailHtml}
+                          className="h-full w-full rounded-lg border-0 bg-zinc-950"
+                          sandbox="allow-same-origin"
+                        />
+                      </div>
+                    </div>
                   </div>
                 )}
               </>

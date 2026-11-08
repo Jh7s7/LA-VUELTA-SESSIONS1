@@ -18,8 +18,55 @@ export interface StoredVoucherRecord {
 let poolInstance: pg.Pool | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
 
+let sslOverride: boolean | null = null;
+
 export function getDatabaseUrl(): string {
-  return (process.env.DATABASE_URL || 'postgresql://postgres@127.0.0.1:5432/lavueltasessions').trim();
+  const raw = (
+    process.env.DATABASE_URL ||
+    process.env.INTERNAL_DATABASE_URL ||
+    process.env.EXTERNAL_DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRESQL_URL ||
+    ''
+  ).trim();
+  if (raw) return raw;
+
+  if (process.env.PGHOST) {
+    const user = encodeURIComponent((process.env.PGUSER || 'postgres').trim());
+    const pass = process.env.PGPASSWORD ? `:${encodeURIComponent(process.env.PGPASSWORD)}` : '';
+    const host = process.env.PGHOST.trim();
+    const port = (process.env.PGPORT || '5432').trim();
+    const dbName = encodeURIComponent((process.env.PGDATABASE || 'lavueltasessions').trim());
+    return `postgresql://${user}${pass}@${host}:${port}/${dbName}`;
+  }
+
+  if (process.env.RENDER) {
+    throw new Error(
+      'FATAL: La variable de entorno DATABASE_URL no está configurada en Render. ' +
+        'En tu panel de Render -> Web Service -> Environment, agrega DATABASE_URL con la Internal Database URL (o External Database URL) de tu base de datos PostgreSQL.'
+    );
+  }
+
+  return 'postgresql://postgres@127.0.0.1:5432/lavueltasessions';
+}
+
+function shouldUseSslByDefault(connectionString: string): boolean {
+  if (sslOverride !== null) return sslOverride;
+  if (process.env.PGSSLMODE === 'disable') return false;
+  if (process.env.PGSSLMODE === 'require') return true;
+  const lower = connectionString.toLowerCase();
+  if (lower.includes('sslmode=disable')) return false;
+  if (
+    lower.includes('sslmode=require') ||
+    lower.includes('.render.com') ||
+    lower.includes('.neon.tech') ||
+    lower.includes('.supabase.co') ||
+    lower.includes('.railway.app') ||
+    lower.includes('.aivencloud.com')
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function getPgPool(): pg.Pool {
@@ -28,14 +75,41 @@ export function getPgPool(): pg.Pool {
     if (!connectionString) {
       throw new Error('FATAL: DATABASE_URL is not configured. Refusing to start without PostgreSQL.');
     }
+    const useSsl = shouldUseSslByDefault(connectionString);
     poolInstance = new Pool({
       connectionString,
       max: 15,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 5000,
+      connectionTimeoutMillis: 10000,
+      ssl: useSsl ? { rejectUnauthorized: false } : false,
     });
   }
   return poolInstance;
+}
+
+export async function verifyPgConnectionWithSslFallback(): Promise<pg.Pool> {
+  const pool = getPgPool();
+  try {
+    await pool.query('SELECT 1');
+    return pool;
+  } catch (err: any) {
+    const msg = String(err?.message || '');
+    const isSslRequiredError =
+      /SSL\/TLS required|must use SSL|no pg_hba\.conf entry.*SSL off|sslmode/i.test(msg);
+    const isSslNotSupportedError = /server does not support SSL/i.test(msg);
+
+    if (isSslRequiredError || isSslNotSupportedError) {
+      sslOverride = isSslRequiredError ? true : false;
+      if (poolInstance) {
+        await poolInstance.end().catch(() => {});
+        poolInstance = null;
+      }
+      const retryPool = getPgPool();
+      await retryPool.query('SELECT 1');
+      return retryPool;
+    }
+    throw err;
+  }
 }
 
 export async function closePgPool(): Promise<void> {
@@ -165,6 +239,27 @@ export async function ensurePostgresSchema(pool: pg.Pool = getPgPool()): Promise
       data JSONB NOT NULL,
       sort_index INTEGER NOT NULL DEFAULT 0
     );
+
+    DO $$
+    DECLARE
+      rec RECORD;
+    BEGIN
+      FOR rec IN
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND is_nullable = 'NO'
+          AND table_name IN (
+            'users', 'sessions', 'events', 'special_campaigns', 'orders',
+            'vouchers', 'tickets', 'access_logs', 'promotions', 'ad_inquiries',
+            'gallery_categories', 'gallery_photos', 'notification_logs',
+            'audit_logs', 'security_audit_logs'
+          )
+          AND column_name NOT IN ('id', 'token_hash', 'order_id', 'data', 'sort_index')
+      LOOP
+        EXECUTE format('ALTER TABLE public.%I ALTER COLUMN %I DROP NOT NULL', rec.table_name, rec.column_name);
+      END LOOP;
+    END $$;
   `);
 }
 
@@ -357,18 +452,23 @@ export async function loadDatabaseFromPostgres<T = any>(pool: pg.Pool = getPgPoo
 async function writeFullDatabaseSnapshotToPostgres(
   db: any,
   vouchers?: StoredVoucherRecord[],
-  pool: pg.Pool = getPgPool()
+  pool: pg.Pool = getPgPool(),
+  replaceAll: boolean = false
 ): Promise<void> {
   const client = await pool.connect();
   const now = new Date().toISOString();
   try {
     await client.query('BEGIN');
 
-    // Sync users
-    await client.query('DELETE FROM users');
+    // Sync users (Non-destructive UPSERT unless explicit backup restore)
+    if (replaceAll) {
+      await client.query('DELETE FROM users');
+    }
     const users = Array.isArray(db.users) ? db.users : [];
     for (let i = 0; i < users.length; i++) {
       const u = users[i];
+      const cleanEmail = String(u.email || '').toLowerCase();
+      await client.query(`DELETE FROM users WHERE email = $1 AND id <> $2`, [cleanEmail, u.id]);
       await client.query(
         `INSERT INTO users (id, email, role, blocked, data, sort_index)
          VALUES ($1, $2, $3, $4, $5::jsonb, $6)
@@ -378,12 +478,16 @@ async function writeFullDatabaseSnapshotToPostgres(
            blocked = EXCLUDED.blocked,
            data = EXCLUDED.data,
            sort_index = EXCLUDED.sort_index`,
-        [u.id, String(u.email || '').toLowerCase(), u.role || 'client', Boolean(u.blocked), JSON.stringify(u), i]
+        [u.id, cleanEmail, u.role || 'client', Boolean(u.blocked), JSON.stringify(u), i]
       );
     }
 
-    // Sync sessions
-    await client.query('DELETE FROM sessions');
+    // Sync sessions (Remove expired sessions, upsert active sessions)
+    if (replaceAll) {
+      await client.query('DELETE FROM sessions');
+    } else {
+      await client.query('DELETE FROM sessions WHERE expires_at <= $1', [Date.now()]);
+    }
     const sessions = Array.isArray(db.sessions) ? db.sessions : [];
     for (let i = 0; i < sessions.length; i++) {
       const s = sessions[i];
@@ -399,14 +503,19 @@ async function writeFullDatabaseSnapshotToPostgres(
       );
     }
 
-    // Sync events
+    // Sync events (Admin can create/edit/delete events)
     await client.query('DELETE FROM events');
     const events = Array.isArray(db.events) ? db.events : [];
     for (let i = 0; i < events.length; i++) {
       const ev = events[i];
       await client.query(
         `INSERT INTO events (id, status, published, data, sort_index)
-         VALUES ($1, $2, $3, $4::jsonb, $5)`,
+         VALUES ($1, $2, $3, $4::jsonb, $5)
+         ON CONFLICT (id) DO UPDATE SET
+           status = EXCLUDED.status,
+           published = EXCLUDED.published,
+           data = EXCLUDED.data,
+           sort_index = EXCLUDED.sort_index`,
         [ev.id, String(ev.status || 'published'), Boolean(ev.published), JSON.stringify(ev), i]
       );
     }
@@ -417,19 +526,30 @@ async function writeFullDatabaseSnapshotToPostgres(
     for (let i = 0; i < campaigns.length; i++) {
       const c = campaigns[i];
       await client.query(
-        `INSERT INTO special_campaigns (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`,
+        `INSERT INTO special_campaigns (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
         [c.id, JSON.stringify(c), i]
       );
     }
 
-    // Sync orders
-    await client.query('DELETE FROM orders');
+    // Sync orders (Non-destructive UPSERT so no order is ever lost)
+    if (replaceAll) {
+      await client.query('DELETE FROM orders');
+    }
     const orders = Array.isArray(db.orders) ? db.orders : [];
     for (let i = 0; i < orders.length; i++) {
       const o = orders[i];
       await client.query(
         `INSERT INTO orders (id, user_id, event_id, status, payment_method, reference, data, sort_index)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+         ON CONFLICT (id) DO UPDATE SET
+           user_id = EXCLUDED.user_id,
+           event_id = EXCLUDED.event_id,
+           status = EXCLUDED.status,
+           payment_method = EXCLUDED.payment_method,
+           reference = EXCLUDED.reference,
+           data = EXCLUDED.data,
+           sort_index = EXCLUDED.sort_index`,
         [
           o.id,
           String(o.userId || ''),
@@ -443,9 +563,11 @@ async function writeFullDatabaseSnapshotToPostgres(
       );
     }
 
-    // If vouchers array is explicitly provided (e.g. during migrate or restore), replace vouchers table
+    // If vouchers array is explicitly provided (e.g. during migrate or restore), upsert vouchers
     if (Array.isArray(vouchers)) {
-      await client.query('DELETE FROM vouchers');
+      if (replaceAll) {
+        await client.query('DELETE FROM vouchers');
+      }
       for (const v of vouchers) {
         if (v && v.orderId && v.dataUrl) {
           await client.query(
@@ -472,14 +594,24 @@ async function writeFullDatabaseSnapshotToPostgres(
       }
     }
 
-    // Sync tickets
-    await client.query('DELETE FROM tickets');
+    // Sync tickets (Non-destructive UPSERT so no issued ticket or QR is ever lost)
+    if (replaceAll) {
+      await client.query('DELETE FROM tickets');
+    }
     const tickets = Array.isArray(db.tickets) ? db.tickets : [];
     for (let i = 0; i < tickets.length; i++) {
       const t = tickets[i];
       await client.query(
         `INSERT INTO tickets (id, code, order_id, user_id, event_id, status, data, sort_index)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+         ON CONFLICT (id) DO UPDATE SET
+           code = EXCLUDED.code,
+           order_id = EXCLUDED.order_id,
+           user_id = EXCLUDED.user_id,
+           event_id = EXCLUDED.event_id,
+           status = EXCLUDED.status,
+           data = EXCLUDED.data,
+           sort_index = EXCLUDED.sort_index`,
         [
           t.id,
           String(t.code || ''),
@@ -494,15 +626,17 @@ async function writeFullDatabaseSnapshotToPostgres(
     }
 
     // Sync access_logs
-    await client.query('DELETE FROM access_logs');
+    if (replaceAll) {
+      await client.query('DELETE FROM access_logs');
+    }
     const accessLogs = Array.isArray(db.accessLogs) ? db.accessLogs : [];
     for (let i = 0; i < accessLogs.length; i++) {
       const a = accessLogs[i];
-      await client.query(`INSERT INTO access_logs (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`, [
-        a.id || `acc_${i}`,
-        JSON.stringify(a),
-        i,
-      ]);
+      await client.query(
+        `INSERT INTO access_logs (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
+        [a.id || `acc_${i}`, JSON.stringify(a), i]
+      );
     }
 
     // Sync promotions
@@ -510,11 +644,11 @@ async function writeFullDatabaseSnapshotToPostgres(
     const promotions = Array.isArray(db.promotions) ? db.promotions : [];
     for (let i = 0; i < promotions.length; i++) {
       const p = promotions[i];
-      await client.query(`INSERT INTO promotions (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`, [
-        p.id || `pro_${i}`,
-        JSON.stringify(p),
-        i,
-      ]);
+      await client.query(
+        `INSERT INTO promotions (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
+        [p.id || `pro_${i}`, JSON.stringify(p), i]
+      );
     }
 
     // Sync ad_inquiries
@@ -522,11 +656,11 @@ async function writeFullDatabaseSnapshotToPostgres(
     const adInquiries = Array.isArray(db.adInquiries) ? db.adInquiries : [];
     for (let i = 0; i < adInquiries.length; i++) {
       const q = adInquiries[i];
-      await client.query(`INSERT INTO ad_inquiries (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`, [
-        q.id || `adinq_${i}`,
-        JSON.stringify(q),
-        i,
-      ]);
+      await client.query(
+        `INSERT INTO ad_inquiries (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
+        [q.id || `adinq_${i}`, JSON.stringify(q), i]
+      );
     }
 
     // Sync gallery_categories
@@ -534,11 +668,11 @@ async function writeFullDatabaseSnapshotToPostgres(
     const galleryCategories = Array.isArray(db.galleryCategories) ? db.galleryCategories : [];
     for (let i = 0; i < galleryCategories.length; i++) {
       const c = galleryCategories[i];
-      await client.query(`INSERT INTO gallery_categories (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`, [
-        c.id || `cat_${i}`,
-        JSON.stringify(c),
-        i,
-      ]);
+      await client.query(
+        `INSERT INTO gallery_categories (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
+        [c.id || `cat_${i}`, JSON.stringify(c), i]
+      );
     }
 
     // Sync gallery_photos
@@ -546,47 +680,53 @@ async function writeFullDatabaseSnapshotToPostgres(
     const galleryPhotos = Array.isArray(db.galleryPhotos) ? db.galleryPhotos : [];
     for (let i = 0; i < galleryPhotos.length; i++) {
       const g = galleryPhotos[i];
-      await client.query(`INSERT INTO gallery_photos (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`, [
-        g.id || `gal_${i}`,
-        JSON.stringify(g),
-        i,
-      ]);
+      await client.query(
+        `INSERT INTO gallery_photos (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
+        [g.id || `gal_${i}`, JSON.stringify(g), i]
+      );
     }
 
     // Sync notification_logs
-    await client.query('DELETE FROM notification_logs');
+    if (replaceAll) {
+      await client.query('DELETE FROM notification_logs');
+    }
     const notificationLogs = Array.isArray(db.notificationLogs) ? db.notificationLogs : [];
     for (let i = 0; i < notificationLogs.length; i++) {
       const n = notificationLogs[i];
-      await client.query(`INSERT INTO notification_logs (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`, [
-        n.id || `not_${i}`,
-        JSON.stringify(n),
-        i,
-      ]);
+      await client.query(
+        `INSERT INTO notification_logs (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
+        [n.id || `not_${i}`, JSON.stringify(n), i]
+      );
     }
 
     // Sync audit_logs
-    await client.query('DELETE FROM audit_logs');
+    if (replaceAll) {
+      await client.query('DELETE FROM audit_logs');
+    }
     const auditLogs = Array.isArray(db.auditLogs) ? db.auditLogs : [];
     for (let i = 0; i < auditLogs.length; i++) {
       const a = auditLogs[i];
-      await client.query(`INSERT INTO audit_logs (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`, [
-        a.id || `aud_${i}`,
-        JSON.stringify(a),
-        i,
-      ]);
+      await client.query(
+        `INSERT INTO audit_logs (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
+        [a.id || `aud_${i}`, JSON.stringify(a), i]
+      );
     }
 
     // Sync security_audit_logs
-    await client.query('DELETE FROM security_audit_logs');
+    if (replaceAll) {
+      await client.query('DELETE FROM security_audit_logs');
+    }
     const securityAuditLogs = Array.isArray(db.securityAuditLogs) ? db.securityAuditLogs : [];
     for (let i = 0; i < securityAuditLogs.length; i++) {
       const s = securityAuditLogs[i];
-      await client.query(`INSERT INTO security_audit_logs (id, data, sort_index) VALUES ($1, $2::jsonb, $3)`, [
-        s.id || `sec_${i}`,
-        JSON.stringify(s),
-        i,
-      ]);
+      await client.query(
+        `INSERT INTO security_audit_logs (id, data, sort_index) VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, sort_index = EXCLUDED.sort_index`,
+        [s.id || `sec_${i}`, JSON.stringify(s), i]
+      );
     }
 
     // Sync kv_config entries
@@ -617,10 +757,14 @@ async function writeFullDatabaseSnapshotToPostgres(
   }
 }
 
-export function enqueuePostgresPersist(db: any, vouchers?: StoredVoucherRecord[]): Promise<void> {
+export function enqueuePostgresPersist(
+  db: any,
+  vouchers?: StoredVoucherRecord[],
+  replaceAll: boolean = false
+): Promise<void> {
   writeQueue = writeQueue
     .catch(() => {})
-    .then(() => writeFullDatabaseSnapshotToPostgres(db, vouchers));
+    .then(() => writeFullDatabaseSnapshotToPostgres(db, vouchers, getPgPool(), replaceAll));
   return writeQueue;
 }
 

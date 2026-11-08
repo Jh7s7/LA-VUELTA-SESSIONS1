@@ -5,12 +5,16 @@ import heroStageImg from '../assets/images/hero_urbana_stage_1793486915838.jpg';
 import vipLoungeAdImg from '../assets/images/ad_vip_lounge_1793486918507.jpg';
 import streetwearAdImg from '../assets/images/ad_streetwear_capsule_1793486918489.jpg';
 import rooftopSessionImg from '../assets/images/session_rooftop_night_1793486919091.jpg';
+import lvLogoImg from '../assets/images/lv-logo.png';
+import lvLogoDarkImg from '../assets/images/lv-logo-dark.png';
 
 export const EDITORIAL_MEDIA = {
   stage: heroStageImg,
   vip_bar: vipLoungeAdImg,
   streetwear: streetwearAdImg,
   rooftop: rooftopSessionImg,
+  logo: lvLogoImg,
+  logoDark: lvLogoDarkImg,
 } as const;
 
 interface EventPosterProps {
@@ -307,7 +311,8 @@ export const QrCodeBox: React.FC<{ payload: string; size?: number }> = ({ payloa
   );
 };
 
-export const OFFICIAL_BRAND_LOGO_SRC = '/assets/aistudio/xxhdpi_f2a8a61a.png';
+export const OFFICIAL_BRAND_LOGO_SRC = lvLogoImg || '/assets/lv-logo.png';
+export const OFFICIAL_BRAND_LOGO_DARK_SRC = lvLogoDarkImg || '/assets/lv-logo-dark.png';
 
 interface AnimatedBrandMarkProps {
   size?: 'sm' | 'md' | 'lg';
@@ -318,6 +323,7 @@ export const AnimatedBrandMark: React.FC<AnimatedBrandMarkProps> = ({
   size = 'md',
   className = '',
 }) => {
+  const [imgSrc, setImgSrc] = useState<string>(OFFICIAL_BRAND_LOGO_SRC);
   const [imgFailed, setImgFailed] = useState(false);
 
   const dims =
@@ -380,11 +386,16 @@ export const AnimatedBrandMark: React.FC<AnimatedBrandMarkProps> = ({
       >
         {!imgFailed ? (
           <img
-            src={OFFICIAL_BRAND_LOGO_SRC}
+            src={imgSrc}
             alt="LA VUELTA SESSIONS"
-            referrerPolicy="no-referrer"
-            onError={() => setImgFailed(true)}
-            className="h-full w-full scale-[1.12] object-cover"
+            onError={() => {
+              if (imgSrc !== '/assets/lv-logo.png') {
+                setImgSrc('/assets/lv-logo.png');
+              } else {
+                setImgFailed(true);
+              }
+            }}
+            className="h-full w-full scale-[1.06] object-cover"
           />
         ) : (
           <svg viewBox="0 0 64 64" className="h-full w-full" aria-hidden="true">

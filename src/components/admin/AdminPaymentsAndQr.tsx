@@ -290,7 +290,11 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     img.src = url;
   };
 
-  const handleSendTicketEmail = async (overrideTicketId?: string) => {
+  const handleSendTicketEmail = async (
+    overrideTicketId?: string,
+    overrideOrderId?: string,
+    overrideEmail?: string
+  ) => {
     const targetTicketId = overrideTicketId || selectedTestTicketId;
     setSendingTestEmail(true);
     setDoorTestFeedback(null);
@@ -307,42 +311,35 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         qrDataUrl?: string;
         emailHtml?: string;
         providerNote?: string;
+        hmacVerified?: boolean;
         ticket?: TicketRecord;
       }>('POST', '/api/tickets/resend', {
         ticketId: targetTicketId || undefined,
-        email: testEmailTarget.trim() || 'forgen122@gmail.com',
-        createDemoIfMissing: true,
+        orderId: overrideOrderId || undefined,
+        email: (overrideEmail || testEmailTarget || 'forgen122@gmail.com').trim(),
+        createDemoIfMissing: !targetTicketId && !overrideOrderId,
       });
 
       setEmailTestResult(resp);
-      if (resp.sentRealSmtp) {
-        onNotify(`Pase enviado exitosamente a ${resp.recipient} por correo electrónico.`, 'success');
-      } else {
-        onNotify(`Simulación exitosa para ${resp.recipient}. Verificando código QR en puerta...`, 'success');
+      setShowEmailPreviewModal(true);
+      if (resp.hmacVerified !== false) {
+        setDoorTestFeedback({
+          tested: true,
+          allowed: true,
+          message:
+            'Firma criptográfica HMAC-SHA256 verificada · Pase VÁLIDO (sin usar) listo para escanear en puerta.',
+          ticketCode: resp.ticketCode,
+          timestamp: new Date().toLocaleTimeString(),
+        });
       }
 
-      // Automatic Door Validation Execution: Validates HMAC and QR immediately
-      const validationPayload = resp.qrPayload || resp.ticketCode;
-      if (validationPayload) {
-        try {
-          const valResp = await apiRequest<{ allowed: boolean; log: AccessValidationLog }>(
-            'POST',
-            '/api/validator/scan',
-            { code: validationPayload }
-          );
-          setDoorTestFeedback({
-            tested: true,
-            allowed: valResp.allowed,
-            message: valResp.log.message,
-            ticketCode: valResp.log.ticketCode,
-            timestamp: new Date().toLocaleTimeString(),
-          });
-          if (valResp.allowed) {
-            onNotify('¡Prueba 100% exitosa! Código QR firmado y validado en puerta con acceso concedido.', 'success');
-          }
-        } catch {
-          // non-blocking
-        }
+      if (resp.sentRealSmtp) {
+        onNotify(`Pase ${resp.ticketCode} enviado exitosamente a ${resp.recipient} por correo electrónico.`, 'success');
+      } else {
+        onNotify(
+          `Simulación de envío exitosa para ${resp.recipient}. Vista previa de correo digital lista.`,
+          'success'
+        );
       }
 
       await onRefresh();
@@ -393,10 +390,19 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     setProcessingOrderId(orderId);
     try {
       const notes = reviewNotesMap[orderId] || '';
-      await apiRequest('POST', `/api/admin/orders/${orderId}/${action}`, { notes });
+      const resp = await apiRequest<{
+        order: OrderRecord;
+        issuedTickets?: TicketRecord[];
+        emailDispatch?: any;
+      }>('POST', `/api/admin/orders/${orderId}/${action}`, { notes });
+
+      if (action === 'approve' && resp.emailDispatch) {
+        setEmailTestResult(resp.emailDispatch);
+      }
+
       onNotify(
         action === 'approve'
-          ? 'Pago aprobado y entradas QR únicas emitidas.'
+          ? `Pago aprobado, entradas QR emitidas y pase enviado/simulado a ${resp.emailDispatch?.recipient || 'correo del comprador'}.`
           : 'Pago rechazado y registrado en auditoría.',
         action === 'approve' ? 'success' : 'info'
       );
@@ -722,15 +728,27 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                           Comprobante
                         </button>
                         {o.status === 'approved' && (
-                          <button
-                            type="button"
-                            disabled={processingOrderId === o.id}
-                            onClick={() => handleRefund(o.id)}
-                            className="inline-flex items-center gap-1 text-xs font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white"
-                          >
-                            <RotateCcw className="h-3 w-3" />
-                            <span>Reembolsar</span>
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              disabled={sendingTestEmail}
+                              onClick={() => handleSendTicketEmail(undefined, o.id, o.payerEmail || o.userEmail)}
+                              className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"
+                              title="Enviar o simular envío de entrada por correo"
+                            >
+                              <Mail className="h-3 w-3" />
+                              <span>Enviar Pase</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={processingOrderId === o.id}
+                              onClick={() => handleRefund(o.id)}
+                              className="inline-flex items-center gap-1 text-xs font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white"
+                            >
+                              <RotateCcw className="h-3 w-3" />
+                              <span>Reembolsar</span>
+                            </button>
+                          </>
                         )}
                       </td>
                     </tr>
@@ -757,6 +775,43 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                 alt="Comprobante"
                 className="mt-4 mx-auto max-h-[65vh] rounded object-contain"
               />
+            </div>
+          </div>
+        )}
+
+        {showEmailPreviewModal && emailTestResult && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
+            <div className="relative flex flex-col h-[90vh] w-full max-w-3xl rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950 overflow-hidden">
+              <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#E50914] text-white">
+                    <Mail className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
+                      Vista Previa de Correo Digital · {emailTestResult.ticketCode}
+                    </h3>
+                    <p className="text-[11px] text-zinc-500">
+                      Para: <span className="font-medium text-zinc-800 dark:text-zinc-200">{emailTestResult.recipient}</span>
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowEmailPreviewModal(false)}
+                  className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="flex-1 bg-zinc-900 p-2 overflow-hidden">
+                <iframe
+                  title="Ticket Email Preview"
+                  srcDoc={emailTestResult.emailHtml || ''}
+                  className="h-full w-full rounded-lg border-0 bg-zinc-950"
+                  sandbox="allow-same-origin"
+                />
+              </div>
             </div>
           </div>
         )}

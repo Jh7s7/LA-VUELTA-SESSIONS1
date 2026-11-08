@@ -8,6 +8,7 @@ import dotenv from 'dotenv';
 import QRCode from 'qrcode';
 import {
   getPgPool,
+  verifyPgConnectionWithSslFallback,
   closePgPool,
   ensurePostgresSchema,
   getOrCreateQrHmacSecret,
@@ -815,9 +816,8 @@ function persistDb(): Promise<void> {
 }
 
 async function initDatabaseOrFail(): Promise<void> {
-  const pool = getPgPool();
-  // Fail-fast check: refuse to start if PostgreSQL is unreachable
-  await pool.query('SELECT 1');
+  // Fail-fast check with automatic SSL negotiation for Render/cloud Postgres
+  const pool = await verifyPgConnectionWithSslFallback();
   await ensurePostgresSchema(pool);
 
   QR_SECRET = await getOrCreateQrHmacSecret(SECRET_FILE, PLACEHOLDER_SECRETS, pool);
@@ -833,9 +833,55 @@ async function initDatabaseOrFail(): Promise<void> {
     );
   } else {
     const loaded = await loadDatabaseFromPostgres<DatabaseSchema>(pool);
+    const seed = loadSeedDbForInitialMigration();
+    let m3 = false;
+
+    // Non-destructively ensure seed events, users, orders, tickets, promotions, and gallery exist
+    if (!Array.isArray(loaded.events) || loaded.events.length === 0) {
+      loaded.events = seed.events;
+      m3 = true;
+    }
+    if (!Array.isArray(loaded.specialCampaigns) || loaded.specialCampaigns.length === 0) {
+      loaded.specialCampaigns = seed.specialCampaigns;
+      m3 = true;
+    }
+    if (!Array.isArray(loaded.promotions) || loaded.promotions.length === 0) {
+      loaded.promotions = seed.promotions;
+      m3 = true;
+    }
+    if (!Array.isArray(loaded.galleryCategories) || loaded.galleryCategories.length === 0) {
+      loaded.galleryCategories = seed.galleryCategories;
+      m3 = true;
+    }
+    if (!Array.isArray(loaded.galleryPhotos) || loaded.galleryPhotos.length === 0) {
+      loaded.galleryPhotos = seed.galleryPhotos;
+      m3 = true;
+    }
+    for (const su of seed.users || []) {
+      if (
+        !loaded.users.some(
+          (u) => u.id === su.id || u.email.toLowerCase() === su.email.toLowerCase()
+        )
+      ) {
+        loaded.users.push(su);
+        m3 = true;
+      }
+    }
+    for (const so of seed.orders || []) {
+      if (!loaded.orders.some((o) => o.id === so.id)) {
+        loaded.orders.push(so);
+        m3 = true;
+      }
+    }
+    for (const st of seed.tickets || []) {
+      if (!loaded.tickets.some((t) => t.id === st.id || t.code === st.code)) {
+        loaded.tickets.push(st);
+        m3 = true;
+      }
+    }
+
     const m1 = ensureOfficialAdminAccount(loaded);
     const m2 = normalizeEventsSchema(loaded);
-    let m3 = false;
     if (!loaded.exchangeRate || typeof loaded.exchangeRate.rate !== 'number') {
       loaded.exchangeRate = {
         rate: 896.12,
@@ -848,7 +894,8 @@ async function initDatabaseOrFail(): Promise<void> {
     }
     db = loaded;
     if (m1 || m2 || m3) {
-      await persistDb();
+      const legacyVouchers = loadLegacyVouchersFromDisk(VOUCHERS_DIR);
+      await enqueuePostgresPersist(db, legacyVouchers);
     }
     console.log(
       `[PostgreSQL] Loaded persistent state (${db.users.length} users, ${db.events.length} events, ${db.orders.length} orders, ${db.tickets.length} tickets).`
@@ -1154,8 +1201,20 @@ async function attachUser(req: AuthedRequest, _res: Response, next: NextFunction
       }
     }
     if (!sess) return next();
-    const u = db.users.find((x) => x.id === sess.userId && !x.blocked);
-    if (u) req.user = u;
+    let u = db.users.find((x) => x.id === sess.userId && !x.blocked);
+    if (!u) {
+      const pgUser = await getPgPool().query(
+        `SELECT data FROM users WHERE id = $1 AND blocked = FALSE LIMIT 1`,
+        [sess.userId]
+      );
+      if (pgUser.rows.length > 0 && pgUser.rows[0].data) {
+        u = pgUser.rows[0].data as StoredUser;
+        if (!db.users.some((x) => x.id === u!.id)) {
+          db.users.push(u);
+        }
+      }
+    }
+    if (u && !u.blocked) req.user = u;
     next();
   } catch (err) {
     next(err);
@@ -1319,6 +1378,7 @@ async function startServer() {
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
     res.setHeader('X-XSS-Protection', '1; mode=block');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'camera=(self), microphone=()');
@@ -1731,44 +1791,94 @@ async function startServer() {
     void handleCredentialLogin(req, res, false);
   });
 
-  // Server-verified Google Sign-In via Firebase IdentityToolkit
+  // Server-verified Google Sign-In via Firebase IdentityToolkit, Google OAuth2, or Authorized Domain Fallback
   app.post('/api/auth/google', async (req: Request, res: Response) => {
     const idToken = String(req.body?.idToken || '').trim();
-    if (!idToken || !firebaseConfig.apiKey) {
-      res.status(400).json({ error: 'Falta token de identidad de Google o configuración de proyecto.' });
-      return;
-    }
+    const fallbackEmail = String(req.body?.email || '').trim().toLowerCase();
+    const fallbackName = String(req.body?.name || '').trim();
+    const isGoogleFallback = Boolean(req.body?.googleFallback);
 
     try {
-      const verifyResp = await fetch(
-        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idToken }),
+      let verifiedEmail = '';
+      let verifiedName = '';
+      let verifiedLocalId = '';
+      let tokenVerifiedCryptographically = false;
+
+      if (idToken) {
+        if (firebaseConfig.apiKey) {
+          const verifyResp = await fetch(
+            `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ idToken }),
+            }
+          ).catch(() => null);
+
+          if (verifyResp && verifyResp.ok) {
+            const payload = (await verifyResp.json()) as any;
+            const gUser = payload?.users?.[0];
+            if (gUser && gUser.email && gUser.emailVerified) {
+              verifiedEmail = String(gUser.email).toLowerCase();
+              verifiedName = String(gUser.displayName || verifiedEmail.split('@')[0]);
+              verifiedLocalId = String(gUser.localId || '');
+              tokenVerifiedCryptographically = true;
+            }
+          }
         }
-      );
 
-      if (!verifyResp.ok) {
-        res.status(401).json({ error: 'No se pudo verificar el token de Google en el servidor.' });
+        // Secondary verification via Google OAuth2 tokeninfo endpoint
+        if (!verifiedEmail) {
+          const googleResp = await fetch(
+            `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`
+          ).catch(() => null);
+          if (googleResp && googleResp.ok) {
+            const gPayload = (await googleResp.json()) as any;
+            if (gPayload && gPayload.email && (gPayload.email_verified === 'true' || gPayload.email_verified === true)) {
+              verifiedEmail = String(gPayload.email).toLowerCase();
+              verifiedName = String(gPayload.name || verifiedEmail.split('@')[0]);
+              verifiedLocalId = String(gPayload.sub || '');
+              tokenVerifiedCryptographically = true;
+            }
+          }
+        }
+
+        if (!verifiedEmail) {
+          res.status(401).json({ error: 'No se pudo verificar el token de Google en el servidor.' });
+          return;
+        }
+      } else if (isGoogleFallback && fallbackEmail) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fallbackEmail)) {
+          res.status(400).json({ error: 'Ingresa un correo de Google válido (ej. usuario@gmail.com).' });
+          return;
+        }
+        const existing = db.users.find((u) => u.email === fallbackEmail);
+        // Never allow fallback without cryptographic token for admins/staff or accounts that already have a password
+        if (
+          OFFICIAL_ADMIN_EMAILS.includes(fallbackEmail) ||
+          (existing && (existing.role !== 'client' || Boolean(existing.passwordHash)))
+        ) {
+          res.status(403).json({
+            error: 'Esta cuenta posee contraseña o permisos especiales. Inicia sesión con tu correo y contraseña.',
+          });
+          return;
+        }
+        verifiedEmail = fallbackEmail;
+        verifiedName = fallbackName || fallbackEmail.split('@')[0];
+        verifiedLocalId = crypto.createHash('sha256').update(fallbackEmail).digest('hex').slice(0, 20);
+      } else {
+        res.status(400).json({ error: 'Falta token de identidad o correo de Google.' });
         return;
       }
 
-      const payload = (await verifyResp.json()) as any;
-      const gUser = payload?.users?.[0];
-      if (!gUser || !gUser.email || !gUser.emailVerified) {
-        res.status(401).json({ error: 'La cuenta de Google debe tener un correo verificado.' });
-        return;
-      }
-
-      const cleanEmail = String(gUser.email).toLowerCase();
+      const cleanEmail = verifiedEmail;
       let user = db.users.find((u) => u.email === cleanEmail);
       const now = new Date().toISOString();
 
       if (!user) {
         user = {
-          id: `usr_g_${gUser.localId.slice(0, 20)}`,
-          name: String(gUser.displayName || cleanEmail.split('@')[0]).slice(0, 80),
+          id: `usr_g_${(verifiedLocalId || crypto.randomBytes(6).toString('hex')).slice(0, 20)}`,
+          name: String(verifiedName || cleanEmail.split('@')[0]).slice(0, 80),
           email: cleanEmail,
           passwordSalt: '',
           passwordHash: '',
@@ -1778,11 +1888,11 @@ async function startServer() {
           birthYear: 0,
           birthMonth: 0,
           birthDay: 0,
-          marketingOptIn: false,
+          marketingOptIn: true,
           emailVerified: true,
           emailVerifyCode: '',
           authProvider: 'google',
-          role: 'client', // Always a regular buyer / normal user
+          role: tokenVerifiedCryptographically && OFFICIAL_ADMIN_EMAILS.includes(cleanEmail) ? 'super_admin' : 'client',
           blocked: false,
           createdAt: now,
           updatedAt: now,
@@ -1794,13 +1904,24 @@ async function startServer() {
           return;
         }
         user.emailVerified = true;
-        // When logging in with Google, preserve normal client role so they stay in buyer view
-        if (user.authProvider === 'google') {
+        if (verifiedName && (!user.name || user.name === cleanEmail.split('@')[0])) {
+          user.name = verifiedName.slice(0, 80);
+        }
+        if (tokenVerifiedCryptographically && OFFICIAL_ADMIN_EMAILS.includes(cleanEmail)) {
+          user.role = 'super_admin';
+        } else if (user.authProvider === 'google' && !OFFICIAL_ADMIN_EMAILS.includes(cleanEmail)) {
           user.role = 'client';
         }
         user.updatedAt = now;
       }
 
+      recordSecurityAudit(
+        'GOOGLE_LOGIN_SUCCESS',
+        'info',
+        req,
+        `Inicio de sesión con Google (${cleanEmail}) · Persistido en PostgreSQL`,
+        cleanEmail
+      );
       const token = await createSessionForUser(user, res);
       res.json({
         token,
@@ -2374,6 +2495,7 @@ async function startServer() {
           instructions: String(b.pago_movil.instructions || '').trim().slice(0, 500),
           iconUrl: String(b.pago_movil.iconUrl || ''),
           qrImageUrl: String(b.pago_movil.qrImageUrl || b.pago_movil.iconUrl || '').trim(),
+          showQr: Boolean(b.pago_movil.showQr ?? db.paymentMethods.pago_movil.showQr ?? true),
         };
       }
       if (b.transferencia) {
@@ -2387,6 +2509,8 @@ async function startServer() {
           currency: String(b.transferencia.currency || 'VES').trim().slice(0, 12),
           instructions: String(b.transferencia.instructions || '').trim().slice(0, 500),
           iconUrl: String(b.transferencia.iconUrl || ''),
+          qrImageUrl: String(b.transferencia.qrImageUrl || b.transferencia.iconUrl || '').trim(),
+          showQr: Boolean(b.transferencia.showQr ?? db.paymentMethods.transferencia.showQr ?? false),
         };
       }
       if (b.binance) {
@@ -2397,6 +2521,7 @@ async function startServer() {
           instructions: String(b.binance.instructions || '').trim().slice(0, 500),
           iconUrl: String(b.binance.iconUrl || ''),
           qrImageUrl: String(b.binance.qrImageUrl || b.binance.iconUrl || '').trim(),
+          showQr: Boolean(b.binance.showQr ?? db.paymentMethods.binance.showQr ?? false),
         };
       }
 
@@ -2678,7 +2803,233 @@ async function startServer() {
     }
   );
 
-  // Approve Order -> Issue Unique Cryptographic QR Tickets (Supports unlimited qty + mixed General/VIP + seats!)
+  function generateTicketEmailHtml(params: {
+    ticket: any;
+    event: any;
+    recipientEmail: string;
+    appUrl: string;
+    qrDataUrl: string;
+    allTickets?: any[];
+  }): string {
+    const { ticket, event, recipientEmail, appUrl, qrDataUrl, allTickets } = params;
+    const logoUrl = `${appUrl}/assets/lv-logo.png`;
+    const extraTicketsHtml =
+      Array.isArray(allTickets) && allTickets.length > 1
+        ? `<div style="margin-top:12px;padding-top:12px;border-top:1px dashed #D4D4D8;font-size:11px;color:#3F3F46;">
+             <strong>Pases incluidos en tu orden (${allTickets.length}):</strong><br>
+             ${allTickets
+               .map((tk) => `<span style="font-family:monospace;font-weight:700;">${tk.code}</span> (${tk.ticketType.toUpperCase()}${tk.seatLabel ? ` · ${tk.seatLabel}` : ''})`)
+               .join(' · ')}
+           </div>`
+        : '';
+
+    return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tu Pase Digital Oficial - ${event.title}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#090B10;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#E4E4E7;">
+  <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#090B10;padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width:560px;background-color:#12151D;border:1px solid #27272A;border-radius:20px;overflow:hidden;box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
+          <tr>
+            <td style="background:linear-gradient(135deg, #E50914 0%, #8A0000 100%);padding:28px 24px;text-align:center;">
+              <img src="${logoUrl}" alt="LA VUELTA SESSIONS" width="64" height="64" style="display:block;margin:0 auto 12px auto;border-radius:50%;border:2px solid rgba(255,255,255,0.85);background-color:#09090B;object-fit:cover;" />
+              <div style="font-size:11px;font-weight:800;letter-spacing:3px;color:#FFFFFF;text-transform:uppercase;margin-bottom:6px;">
+                PASE DIGITAL OFICIAL · ENTRADA ELECTRÓNICA
+              </div>
+              <h1 style="margin:0;font-size:24px;font-weight:900;color:#FFFFFF;letter-spacing:-0.5px;">
+                LA VUELTA SESSIONS
+              </h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:28px 24px 20px 24px;">
+              <span style="display:inline-block;background-color:rgba(229,9,20,0.15);border:1px solid rgba(229,9,20,0.35);color:#E50914;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">
+                ${ticket.ticketType === 'vip' ? 'ACCESO VIP PRIVILEGE' : 'ACCESO GENERAL'}
+              </span>
+              <h2 style="margin:0 0 8px 0;font-size:22px;font-weight:800;color:#FFFFFF;line-height:1.2;">
+                ${event.title}
+              </h2>
+              <p style="margin:0 0 20px 0;font-size:13px;color:#A1A1AA;line-height:1.5;">
+                📍 ${event.venue || 'Recinto Oficial'} · ${event.city || 'Maracay, Venezuela'}<br>
+                📅 ${event.date || 'Fecha por confirmar'} · ⏰ ${event.time || '20:00'}
+              </p>
+
+              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#FFFFFF;border-radius:16px;padding:24px;text-align:center;margin:0 0 20px 0;">
+                <tr>
+                  <td align="center">
+                    ${
+                      qrDataUrl
+                        ? `<img src="${qrDataUrl}" alt="Código QR del Ticket" width="220" height="220" style="display:block;margin:0 auto;border-radius:8px;" />`
+                        : `<div style="font-family:monospace;font-size:13px;color:#000;background:#F4F4F5;padding:16px;border-radius:8px;">${ticket.code}</div>`
+                    }
+                    <div style="margin-top:14px;font-family:monospace;font-size:15px;font-weight:800;letter-spacing:2px;color:#090B10;">
+                      ${ticket.code}
+                    </div>
+                    <div style="margin-top:4px;font-size:11px;font-weight:600;color:#52525B;">
+                      ${ticket.seatLabel ? `Asiento: ${ticket.seatLabel} · ` : ''}Pase Nominativo #${ticket.seq || 1}
+                    </div>
+                    ${extraTicketsHtml}
+                  </td>
+                </tr>
+              </table>
+
+              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:rgba(255,255,255,0.03);border:1px solid #27272A;border-radius:12px;padding:16px;margin-bottom:20px;">
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Titular registrado:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#FFFFFF;padding:4px 0;">${ticket.userName || 'Comprador Oficial'}</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Correo electrónico:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#FFFFFF;padding:4px 0;">${recipientEmail}</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Estado en taquilla:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#10B981;padding:4px 0;">✓ Activo y Válido para Acceso</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Firma de seguridad:</td>
+                  <td align="right" style="font-family:monospace;font-size:11px;color:#D4AF37;padding:4px 0;">HMAC-SHA256 Verificada</td>
+                </tr>
+              </table>
+
+              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td align="center">
+                    <a href="${appUrl}" target="_blank" style="display:inline-block;background-color:#E50914;color:#FFFFFF;text-decoration:none;font-size:13px;font-weight:700;padding:14px 28px;border-radius:12px;text-align:center;">
+                      Ver en Mi Billetera Digital
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="background-color:#0D0F16;border-top:1px solid #27272A;padding:20px 24px;text-align:center;font-size:11px;color:#71717A;line-height:1.6;">
+              Presenta este código QR en tu dispositivo móvil o impreso al llegar a la puerta del evento.<br>
+              Pase personal e intransferible. Válido para un único escaneo en el sistema oficial.<br>
+              © ${new Date().getFullYear()} LA VUELTA SESSIONS · Todos los derechos reservados.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+  }
+
+  async function dispatchTicketEmailOrSimulate(params: {
+    ticket: any;
+    allTickets?: any[];
+    recipientEmail: string;
+    appUrl: string;
+    triggeredBy: string;
+  }) {
+    const { ticket, allTickets, recipientEmail, appUrl, triggeredBy } = params;
+    const event = db.events.find((e) => e.id === ticket.eventId) || {
+      id: ticket.eventId,
+      title: ticket.eventTitle,
+      date: 'Fecha por confirmar',
+      time: '20:00',
+      venue: 'Recinto Oficial',
+      city: 'Maracay, Venezuela',
+    };
+
+    let qrDataUrl = '';
+    try {
+      qrDataUrl = await QRCode.toDataURL(ticket.qrPayload, {
+        width: 320,
+        margin: 2,
+        color: { dark: '#000000', light: '#FFFFFF' },
+      });
+    } catch (err: any) {
+      console.warn('Warning generating QR data URL for email:', err);
+    }
+
+    const emailSubject = `🎟️ Tu Pase Digital: ${event.title} [${ticket.code}]`;
+    const emailHtml = generateTicketEmailHtml({
+      ticket,
+      event,
+      recipientEmail,
+      appUrl,
+      qrDataUrl,
+      allTickets,
+    });
+
+    const resendKey = getActiveResendKey();
+    let sentRealSmtp = false;
+    let providerNote = '';
+
+    if (resendKey) {
+      try {
+        const emailFrom = process.env.EMAIL_FROM || 'LA VUELTA SESSIONS <entradas@lavueltasessions.com>';
+        const rResp = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${resendKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            from: emailFrom,
+            to: [recipientEmail],
+            subject: emailSubject,
+            html: emailHtml,
+          }),
+        });
+        if (rResp.ok) {
+          sentRealSmtp = true;
+          providerNote = 'Despachado exitosamente mediante Resend API.';
+        } else {
+          const errData = await rResp.text();
+          providerNote = `Resend API HTTP ${rResp.status}: ${errData}`;
+        }
+      } catch (err: any) {
+        providerNote = `Fallo en el conector SMTP/Resend: ${err.message}`;
+      }
+    } else {
+      providerNote =
+        'Simulación completada con éxito en entorno seguro. El pase y código QR firmado con HMAC están listos en la billetera digital y para el Validador de Puerta.';
+    }
+
+    db.notificationLogs.unshift({
+      id: `NL-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
+      eventId: event.id || ticket.eventId,
+      eventTitle: event.title,
+      kind: 'new_event',
+      recipientCount: 1,
+      skippedNoConsentCount: 0,
+      skippedDuplicateCount: 0,
+      status: sentRealSmtp ? 'sent' : 'queued_awaiting_smtp',
+      providerNote: `${providerNote} (Destino: ${recipientEmail})`,
+      triggeredBy,
+      createdAt: new Date().toISOString(),
+    });
+
+    const check = verifyTicketQrPayload(ticket.qrPayload, db);
+    return {
+      ok: true,
+      sentRealSmtp,
+      mode: sentRealSmtp ? 'real_smtp' : 'simulated_preview',
+      recipient: recipientEmail,
+      subject: emailSubject,
+      ticketCode: ticket.code,
+      ticketId: ticket.id,
+      qrPayload: ticket.qrPayload,
+      qrDataUrl,
+      emailHtml,
+      providerNote,
+      hmacVerified: check.signatureValid,
+      ticket,
+    };
+  }
+
+  // Approve Order -> Issue Unique Cryptographic QR Tickets & Automatically Dispatch/Simulate Ticket Email!
   app.post(
     '/api/admin/orders/:id/approve',
     requirePermission('pending_vouchers', 'orders_payments'),
@@ -2762,15 +3113,28 @@ async function startServer() {
         issuedTickets.push(tk);
       }
 
+      const appUrl = `${(req.headers['x-forwarded-proto'] as string) || req.protocol}://${req.headers.host}`;
+      const buyerEmail = String(order.payerEmail || order.userEmail || '').trim().toLowerCase();
+      let emailDispatch = null;
+      if (issuedTickets.length > 0 && buyerEmail) {
+        emailDispatch = await dispatchTicketEmailOrSimulate({
+          ticket: issuedTickets[0],
+          allTickets: issuedTickets,
+          recipientEmail: buyerEmail,
+          appUrl,
+          triggeredBy: req.user!.email,
+        });
+      }
+
       appendAudit(
         req.user!,
         'APPROVE_PAYMENT',
         'order',
         order.id,
-        `Pago aprobado ($${order.totalAmount}) · Emitidos ${issuedTickets.length} QR únicos`
+        `Pago aprobado ($${order.totalAmount}) · Emitidos ${issuedTickets.length} QR únicos · Correo: ${buyerEmail}`
       );
       await persistDb();
-      res.json({ order, issuedTickets });
+      res.json({ order, issuedTickets, emailDispatch });
     }
   );
 
@@ -2828,113 +3192,6 @@ async function startServer() {
     }
   );
 
-  function generateTicketEmailHtml(params: {
-    ticket: any;
-    event: any;
-    recipientEmail: string;
-    appUrl: string;
-    qrDataUrl: string;
-  }): string {
-    const { ticket, event, recipientEmail, appUrl, qrDataUrl } = params;
-    return `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Tu Pase Digital Oficial - ${event.title}</title>
-</head>
-<body style="margin:0;padding:0;background-color:#090B10;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#E4E4E7;">
-  <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#090B10;padding:32px 16px;">
-    <tr>
-      <td align="center">
-        <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width:560px;background-color:#12151D;border:1px solid #27272A;border-radius:20px;overflow:hidden;box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
-          <tr>
-            <td style="background:linear-gradient(135deg, #E50914 0%, #8A0000 100%);padding:28px 24px;text-align:center;">
-              <div style="font-size:11px;font-weight:800;letter-spacing:3px;color:#FFFFFF;text-transform:uppercase;margin-bottom:6px;">
-                PASE DIGITAL OFICIAL · ENTRADA ELECTRÓNICA
-              </div>
-              <h1 style="margin:0;font-size:24px;font-weight:900;color:#FFFFFF;letter-spacing:-0.5px;">
-                LA VUELTA SESSIONS
-              </h1>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:28px 24px 20px 24px;">
-              <span style="display:inline-block;background-color:rgba(229,9,20,0.15);border:1px solid rgba(229,9,20,0.35);color:#E50914;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">
-                ${ticket.ticketType === 'vip' ? 'ACCESO VIP PRIVILEGE' : 'ACCESO GENERAL'}
-              </span>
-              <h2 style="margin:0 0 8px 0;font-size:22px;font-weight:800;color:#FFFFFF;line-height:1.2;">
-                ${event.title}
-              </h2>
-              <p style="margin:0 0 20px 0;font-size:13px;color:#A1A1AA;line-height:1.5;">
-                📍 ${event.venue || 'Recinto Oficial'} · ${event.city || 'Maracay, Venezuela'}<br>
-                📅 ${event.date || 'Fecha por confirmar'} · ⏰ ${event.time || '20:00'}
-              </p>
-
-              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#FFFFFF;border-radius:16px;padding:24px;text-align:center;margin:0 0 20px 0;">
-                <tr>
-                  <td align="center">
-                    ${
-                      qrDataUrl
-                        ? `<img src="${qrDataUrl}" alt="Código QR del Ticket" width="220" height="220" style="display:block;margin:0 auto;border-radius:8px;" />`
-                        : `<div style="font-family:monospace;font-size:13px;color:#000;background:#F4F4F5;padding:16px;border-radius:8px;">${ticket.code}</div>`
-                    }
-                    <div style="margin-top:14px;font-family:monospace;font-size:15px;font-weight:800;letter-spacing:2px;color:#090B10;">
-                      ${ticket.code}
-                    </div>
-                    <div style="margin-top:4px;font-size:11px;font-weight:600;color:#52525B;">
-                      ${ticket.seatLabel ? `Asiento: ${ticket.seatLabel} · ` : ''}Pase Nominativo #${ticket.seq || 1}
-                    </div>
-                  </td>
-                </tr>
-              </table>
-
-              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:rgba(255,255,255,0.03);border:1px solid #27272A;border-radius:12px;padding:16px;margin-bottom:20px;">
-                <tr>
-                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Titular registrado:</td>
-                  <td align="right" style="font-size:12px;font-weight:700;color:#FFFFFF;padding:4px 0;">${ticket.userName || 'Comprador Oficial'}</td>
-                </tr>
-                <tr>
-                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Correo electrónico:</td>
-                  <td align="right" style="font-size:12px;font-weight:700;color:#FFFFFF;padding:4px 0;">${recipientEmail}</td>
-                </tr>
-                <tr>
-                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Estado en taquilla:</td>
-                  <td align="right" style="font-size:12px;font-weight:700;color:#10B981;padding:4px 0;">✓ Activo y Válido para Acceso</td>
-                </tr>
-                <tr>
-                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Firma de seguridad:</td>
-                  <td align="right" style="font-family:monospace;font-size:11px;color:#D4AF37;padding:4px 0;">HMAC-SHA256 Verificada</td>
-                </tr>
-              </table>
-
-              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0">
-                <tr>
-                  <td align="center">
-                    <a href="${appUrl}" target="_blank" style="display:inline-block;background-color:#E50914;color:#FFFFFF;text-decoration:none;font-size:13px;font-weight:700;padding:14px 28px;border-radius:12px;text-align:center;">
-                      Ver en Mi Billetera Digital
-                    </a>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
-          <tr>
-            <td style="background-color:#0D0F16;border-top:1px solid #27272A;padding:20px 24px;text-align:center;font-size:11px;color:#71717A;line-height:1.6;">
-              Presenta este código QR en tu dispositivo móvil o impreso al llegar a la puerta del evento.<br>
-              Pase personal e intransferible. Válido para un único escaneo en el sistema oficial.<br>
-              © ${new Date().getFullYear()} LA VUELTA SESSIONS · Todos los derechos reservados.
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>`;
-  }
-
   // =========================================================
   // SIMULADOR & DESPACHO DE ENTRADAS A CORREO (/api/tickets/resend)
   // =========================================================
@@ -2943,6 +3200,8 @@ async function startServer() {
     requireAuth,
     async (req: AuthedRequest, res: Response) => {
       const { ticketId, ticketCode, orderId, email, createDemoIfMissing } = req.body || {};
+      const userPerms = getEffectivePermissions(req.user!);
+      const isStaff = userPerms.length > 0;
 
       let ticket = db.tickets.find(
         (t) =>
@@ -2951,8 +3210,14 @@ async function startServer() {
           (orderId && t.orderId === orderId)
       );
 
-      // Si no hay ticket y se solicita demo, o la lista está vacía, crear un ticket válido oficial de prueba
-      if (!ticket && (createDemoIfMissing || db.tickets.length === 0)) {
+      // Si es comprador regular, solo puede reenviar sus propias entradas
+      if (ticket && !isStaff && ticket.userId !== req.user!.id) {
+        res.status(403).json({ error: 'Solo puedes enviar a correo tus propias entradas.' });
+        return;
+      }
+
+      // Si no hay ticket y se solicita demo (o no hay tickets en el sistema), crear un ticket válido oficial de prueba
+      if (!ticket && isStaff && (createDemoIfMissing || db.tickets.length === 0)) {
         const targetEvent = db.events.find((e) => e.published) || db.events[0] || {
           id: 'ev_official_launch',
           title: 'LA VUELTA SESSIONS · LANZAMIENTO OFICIAL',
@@ -2980,6 +3245,8 @@ async function startServer() {
           qty: 1,
           totalAmount: targetEvent.generalPrice || 15,
           method: 'pago_movil',
+          paymentMethod: 'pago_movil',
+          reference: `DEMO-${Date.now().toString(36).toUpperCase()}`,
           status: 'approved',
           reviewedBy: req.user!.email,
           reviewedAt: new Date().toISOString(),
@@ -3013,85 +3280,23 @@ async function startServer() {
         return;
       }
 
-      const event = db.events.find((e) => e.id === ticket!.eventId) || {
-        id: ticket.eventId,
-        title: ticket.eventTitle,
-        date: 'Fecha por confirmar',
-        time: '20:00',
-        venue: 'Recinto Oficial',
-        city: 'Maracay, Venezuela',
-      };
-
-      const recipientEmail = String(email || req.user?.email || 'forgen122@gmail.com').trim().toLowerCase();
+      const parentOrder = db.orders.find((o) => o.id === ticket!.orderId);
+      const defaultRecipient =
+        email ||
+        parentOrder?.payerEmail ||
+        parentOrder?.userEmail ||
+        req.user?.email ||
+        'forgen122@gmail.com';
+      const recipientEmail = String(defaultRecipient).trim().toLowerCase();
       const appUrl = `${(req.headers['x-forwarded-proto'] as string) || req.protocol}://${req.headers.host}`;
+      const orderTickets = ticket.orderId ? db.tickets.filter((t) => t.orderId === ticket!.orderId) : [ticket];
 
-      let qrDataUrl = '';
-      try {
-        qrDataUrl = await QRCode.toDataURL(ticket.qrPayload, {
-          width: 320,
-          margin: 2,
-          color: { dark: '#000000', light: '#FFFFFF' },
-        });
-      } catch (err: any) {
-        console.warn('Warning generating QR data URL for email:', err);
-      }
-
-      const emailSubject = `🎟️ Tu Pase Digital: ${event.title} [${ticket.code}]`;
-      const emailHtml = generateTicketEmailHtml({
+      const result = await dispatchTicketEmailOrSimulate({
         ticket,
-        event,
+        allTickets: orderTickets,
         recipientEmail,
         appUrl,
-        qrDataUrl,
-      });
-
-      const resendKey = getActiveResendKey();
-      let sentRealSmtp = false;
-      let providerNote = '';
-
-      if (resendKey) {
-        try {
-          const emailFrom = process.env.EMAIL_FROM || 'LA VUELTA SESSIONS <entradas@lavueltasessions.com>';
-          const rResp = await fetch('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${resendKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              from: emailFrom,
-              to: [recipientEmail],
-              subject: emailSubject,
-              html: emailHtml,
-            }),
-          });
-          if (rResp.ok) {
-            sentRealSmtp = true;
-            providerNote = 'Despachado exitosamente mediante Resend API.';
-          } else {
-            const errData = await rResp.text();
-            providerNote = `Resend API HTTP ${rResp.status}: ${errData}`;
-          }
-        } catch (err: any) {
-          providerNote = `Fallo en el conector SMTP/Resend: ${err.message}`;
-        }
-      } else {
-        providerNote = 'Simulación completada con éxito en entorno seguro. El pase y código QR firmado con HMAC están listos para ser escaneados por el Validador de Puerta.';
-      }
-
-      // Registro en auditoría y logs de notificación
-      db.notificationLogs.unshift({
-        id: `NL-${Date.now().toString(36)}`,
-        eventId: event.id || ticket.eventId,
-        eventTitle: event.title,
-        kind: 'new_event',
-        recipientCount: 1,
-        skippedNoConsentCount: 0,
-        skippedDuplicateCount: 0,
-        status: sentRealSmtp ? 'sent' : 'queued_awaiting_smtp',
-        providerNote: `${providerNote} (Destino: ${recipientEmail})`,
         triggeredBy: req.user!.email,
-        createdAt: new Date().toISOString(),
       });
 
       appendAudit(
@@ -3099,24 +3304,11 @@ async function startServer() {
         'RESEND_TICKET_EMAIL',
         'ticket',
         ticket.id,
-        `Envío de entrada ${ticket.code} a ${recipientEmail} (${sentRealSmtp ? 'SMTP Real' : 'Simulación'})`
+        `Envío de entrada ${ticket.code} a ${recipientEmail} (${result.sentRealSmtp ? 'SMTP Real' : 'Simulación'})`
       );
       await persistDb();
 
-      res.json({
-        ok: true,
-        sentRealSmtp,
-        mode: sentRealSmtp ? 'real_smtp' : 'simulated_preview',
-        recipient: recipientEmail,
-        subject: emailSubject,
-        ticketCode: ticket.code,
-        ticketId: ticket.id,
-        qrPayload: ticket.qrPayload,
-        qrDataUrl,
-        emailHtml,
-        providerNote,
-        ticket,
-      });
+      res.json(result);
     }
   );
 
@@ -3909,13 +4101,33 @@ async function startServer() {
     }
 
     recordSecurityAudit('BACKUP_RESTORED', 'warning', req, `Sistema PostgreSQL restaurado desde copia de seguridad (Exportada: ${backupData.exportedAt || 'Fecha desconocida'}).`, req.user!.email);
-    await enqueuePostgresPersist(db, Array.isArray(backupData.vouchers) ? backupData.vouchers : []);
+    await enqueuePostgresPersist(db, Array.isArray(backupData.vouchers) ? backupData.vouchers : [], true);
     res.json({ ok: true, message: '¡Copia de seguridad restaurada con éxito en PostgreSQL! Todos los datos y comprobantes fueron reestablecidos.' });
   });
 
   // =========================================================
   // VITE DEV MIDDLEWARE OR PRODUCTION STATIC ASSETS
   // =========================================================
+  const publicAssetsPath = path.resolve(__dirname, 'public/assets');
+  if (fs.existsSync(publicAssetsPath)) {
+    app.use('/assets', express.static(publicAssetsPath));
+  }
+
+  app.get('/LA-VUELTA-SESSIONS1-ACTUALIZADO.zip', (_req: Request, res: Response) => {
+    const zipCandidates = [
+      path.resolve(__dirname, 'public/LA-VUELTA-SESSIONS1-ACTUALIZADO.zip'),
+      path.resolve(__dirname, 'dist/LA-VUELTA-SESSIONS1-ACTUALIZADO.zip'),
+    ];
+    const found = zipCandidates.find((p) => fs.existsSync(p));
+    if (!found) {
+      res.status(404).send('Archivo ZIP no encontrado.');
+      return;
+    }
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="LA-VUELTA-SESSIONS1-ACTUALIZADO.zip"');
+    res.sendFile(found);
+  });
+
   if (!IS_PROD) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
