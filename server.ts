@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import QRCode from 'qrcode';
 import {
+  hasConfiguredDatabaseUrl,
   getPgPool,
   verifyPgConnectionWithSslFallback,
   closePgPool,
@@ -808,100 +809,169 @@ function loadSeedDbForInitialMigration(): DatabaseSchema {
 }
 
 let db: DatabaseSchema = buildInitialDb();
+let pgAvailable = false;
 
-function persistDb(): Promise<void> {
-  return enqueuePostgresPersist(db).catch((err) => {
-    console.error('CRITICAL: Failed to persist state to PostgreSQL:', err);
-    throw err;
-  });
+function saveLocalDbSnapshot(): void {
+  const payload = JSON.stringify(db, null, 2);
+  try {
+    fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+    fs.writeFileSync(DB_FILE, payload, 'utf8');
+  } catch (err) {
+    console.warn('[Storage] Could not write DB_FILE snapshot:', err);
+  }
+  try {
+    fs.mkdirSync(WORKSPACE_DATA_DIR, { recursive: true });
+    fs.writeFileSync(WORKSPACE_DB_FILE, payload, 'utf8');
+  } catch {
+    // Ignore read-only workspace warning
+  }
+}
+
+function resolveFallbackQrSecret(): string {
+  const envSecret = (process.env.QR_HMAC_SECRET || '').trim();
+  if (envSecret.length >= 16 && !PLACEHOLDER_SECRETS.has(envSecret)) {
+    return envSecret;
+  }
+  try {
+    if (fs.existsSync(SECRET_FILE)) {
+      const existing = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+      if (existing.length >= 16 && !PLACEHOLDER_SECRETS.has(existing)) {
+        return existing;
+      }
+    }
+  } catch {
+    // Ignore
+  }
+  const generated = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(SECRET_FILE), { recursive: true });
+    fs.writeFileSync(SECRET_FILE, generated, { mode: 0o600 });
+  } catch {
+    // Ignore
+  }
+  return generated;
+}
+
+async function persistDb(): Promise<void> {
+  saveLocalDbSnapshot();
+  if (!pgAvailable) return;
+  try {
+    await enqueuePostgresPersist(db);
+  } catch (err) {
+    console.warn('Warning: Failed to persist state to PostgreSQL (local snapshot saved):', err);
+  }
 }
 
 async function initDatabaseOrFail(): Promise<void> {
-  // Fail-fast check with automatic SSL negotiation for Render/cloud Postgres
-  const pool = await verifyPgConnectionWithSslFallback();
-  await ensurePostgresSchema(pool);
+  const shouldAttemptPostgres = !process.env.RENDER || hasConfiguredDatabaseUrl();
+  if (shouldAttemptPostgres) {
+    try {
+      const pool = await verifyPgConnectionWithSslFallback();
+      await ensurePostgresSchema(pool);
 
-  QR_SECRET = await getOrCreateQrHmacSecret(SECRET_FILE, PLACEHOLDER_SECRETS, pool);
+      QR_SECRET = await getOrCreateQrHmacSecret(SECRET_FILE, PLACEHOLDER_SECRETS, pool);
 
-  const populated = await isPostgresPopulated(pool);
-  if (!populated) {
-    const seed = loadSeedDbForInitialMigration();
-    const legacyVouchers = loadLegacyVouchersFromDisk(VOUCHERS_DIR);
-    await enqueuePostgresPersist(seed, legacyVouchers);
-    db = seed;
-    console.log(
-      `[PostgreSQL] Initialized database from seed (${db.users.length} users, ${db.events.length} events, ${db.orders.length} orders, ${legacyVouchers.length} vouchers).`
-    );
+      const populated = await isPostgresPopulated(pool);
+      if (!populated) {
+        const seed = loadSeedDbForInitialMigration();
+        const legacyVouchers = loadLegacyVouchersFromDisk(VOUCHERS_DIR);
+        await enqueuePostgresPersist(seed, legacyVouchers);
+        db = seed;
+        console.log(
+          `[PostgreSQL] Initialized database from seed (${db.users.length} users, ${db.events.length} events, ${db.orders.length} orders, ${legacyVouchers.length} vouchers).`
+        );
+      } else {
+        const loaded = await loadDatabaseFromPostgres<DatabaseSchema>(pool);
+        const seed = loadSeedDbForInitialMigration();
+        let m3 = false;
+
+        // Non-destructively ensure seed events, users, orders, tickets, promotions, and gallery exist
+        if (!Array.isArray(loaded.events) || loaded.events.length === 0) {
+          loaded.events = seed.events;
+          m3 = true;
+        }
+        if (!Array.isArray(loaded.specialCampaigns) || loaded.specialCampaigns.length === 0) {
+          loaded.specialCampaigns = seed.specialCampaigns;
+          m3 = true;
+        }
+        if (!Array.isArray(loaded.promotions) || loaded.promotions.length === 0) {
+          loaded.promotions = seed.promotions;
+          m3 = true;
+        }
+        if (!Array.isArray(loaded.galleryCategories) || loaded.galleryCategories.length === 0) {
+          loaded.galleryCategories = seed.galleryCategories;
+          m3 = true;
+        }
+        if (!Array.isArray(loaded.galleryPhotos) || loaded.galleryPhotos.length === 0) {
+          loaded.galleryPhotos = seed.galleryPhotos;
+          m3 = true;
+        }
+        for (const su of seed.users || []) {
+          if (
+            !loaded.users.some(
+              (u) => u.id === su.id || u.email.toLowerCase() === su.email.toLowerCase()
+            )
+          ) {
+            loaded.users.push(su);
+            m3 = true;
+          }
+        }
+        for (const so of seed.orders || []) {
+          if (!loaded.orders.some((o) => o.id === so.id)) {
+            loaded.orders.push(so);
+            m3 = true;
+          }
+        }
+        for (const st of seed.tickets || []) {
+          if (!loaded.tickets.some((t) => t.id === st.id || t.code === st.code)) {
+            loaded.tickets.push(st);
+            m3 = true;
+          }
+        }
+
+        const m1 = ensureOfficialAdminAccount(loaded);
+        const m2 = normalizeEventsSchema(loaded);
+        if (!loaded.exchangeRate || typeof loaded.exchangeRate.rate !== 'number') {
+          loaded.exchangeRate = {
+            rate: 896.12,
+            currency: 'VES',
+            source: 'Banco Central de Venezuela (BCV Oficial)',
+            lastUpdated: new Date().toISOString(),
+            mode: 'auto',
+          };
+          m3 = true;
+        }
+        db = loaded;
+        if (m1 || m2 || m3) {
+          const legacyVouchers = loadLegacyVouchersFromDisk(VOUCHERS_DIR);
+          await enqueuePostgresPersist(db, legacyVouchers);
+        }
+        console.log(
+          `[PostgreSQL] Loaded persistent state (${db.users.length} users, ${db.events.length} events, ${db.orders.length} orders, ${db.tickets.length} tickets).`
+        );
+      }
+      pgAvailable = true;
+      saveLocalDbSnapshot();
+      return;
+    } catch (pgErr: any) {
+      pgAvailable = false;
+      console.warn(
+        `[Storage] PostgreSQL connection unavailable (${pgErr?.message || pgErr}). Falling back to local persistent JSON storage.`
+      );
+    }
   } else {
-    const loaded = await loadDatabaseFromPostgres<DatabaseSchema>(pool);
-    const seed = loadSeedDbForInitialMigration();
-    let m3 = false;
-
-    // Non-destructively ensure seed events, users, orders, tickets, promotions, and gallery exist
-    if (!Array.isArray(loaded.events) || loaded.events.length === 0) {
-      loaded.events = seed.events;
-      m3 = true;
-    }
-    if (!Array.isArray(loaded.specialCampaigns) || loaded.specialCampaigns.length === 0) {
-      loaded.specialCampaigns = seed.specialCampaigns;
-      m3 = true;
-    }
-    if (!Array.isArray(loaded.promotions) || loaded.promotions.length === 0) {
-      loaded.promotions = seed.promotions;
-      m3 = true;
-    }
-    if (!Array.isArray(loaded.galleryCategories) || loaded.galleryCategories.length === 0) {
-      loaded.galleryCategories = seed.galleryCategories;
-      m3 = true;
-    }
-    if (!Array.isArray(loaded.galleryPhotos) || loaded.galleryPhotos.length === 0) {
-      loaded.galleryPhotos = seed.galleryPhotos;
-      m3 = true;
-    }
-    for (const su of seed.users || []) {
-      if (
-        !loaded.users.some(
-          (u) => u.id === su.id || u.email.toLowerCase() === su.email.toLowerCase()
-        )
-      ) {
-        loaded.users.push(su);
-        m3 = true;
-      }
-    }
-    for (const so of seed.orders || []) {
-      if (!loaded.orders.some((o) => o.id === so.id)) {
-        loaded.orders.push(so);
-        m3 = true;
-      }
-    }
-    for (const st of seed.tickets || []) {
-      if (!loaded.tickets.some((t) => t.id === st.id || t.code === st.code)) {
-        loaded.tickets.push(st);
-        m3 = true;
-      }
-    }
-
-    const m1 = ensureOfficialAdminAccount(loaded);
-    const m2 = normalizeEventsSchema(loaded);
-    if (!loaded.exchangeRate || typeof loaded.exchangeRate.rate !== 'number') {
-      loaded.exchangeRate = {
-        rate: 896.12,
-        currency: 'VES',
-        source: 'Banco Central de Venezuela (BCV Oficial)',
-        lastUpdated: new Date().toISOString(),
-        mode: 'auto',
-      };
-      m3 = true;
-    }
-    db = loaded;
-    if (m1 || m2 || m3) {
-      const legacyVouchers = loadLegacyVouchersFromDisk(VOUCHERS_DIR);
-      await enqueuePostgresPersist(db, legacyVouchers);
-    }
+    pgAvailable = false;
     console.log(
-      `[PostgreSQL] Loaded persistent state (${db.users.length} users, ${db.events.length} events, ${db.orders.length} orders, ${db.tickets.length} tickets).`
+      '[Storage] DATABASE_URL not configured in Render environment. Using local persistent JSON storage.'
     );
   }
+
+  QR_SECRET = resolveFallbackQrSecret();
+  db = loadSeedDbForInitialMigration();
+  saveLocalDbSnapshot();
+  console.log(
+    `[Storage] Initialized local database (${db.users.length} users, ${db.events.length} events, ${db.orders.length} orders, ${db.tickets.length} tickets).`
+  );
 }
 
 async function updateOfficialExchangeRate(): Promise<void> {
@@ -1185,7 +1255,7 @@ async function attachUser(req: AuthedRequest, _res: Response, next: NextFunction
     const th = hashToken(raw);
     const now = Date.now();
     let sess = db.sessions.find((s) => s.tokenHash === th && s.expiresAt > now);
-    if (!sess) {
+    if (!sess && pgAvailable) {
       const pgSess = await getPgPool().query(
         `SELECT token_hash, user_id, expires_at, created_at FROM sessions WHERE token_hash = $1 AND expires_at > $2 LIMIT 1`,
         [th, now]
@@ -1203,7 +1273,7 @@ async function attachUser(req: AuthedRequest, _res: Response, next: NextFunction
     }
     if (!sess) return next();
     let u = db.users.find((x) => x.id === sess.userId && !x.blocked);
-    if (!u) {
+    if (!u && pgAvailable) {
       const pgUser = await getPgPool().query(
         `SELECT data FROM users WHERE id = $1 AND blocked = FALSE LIMIT 1`,
         [sess.userId]
@@ -2358,7 +2428,13 @@ async function startServer() {
       memoryVouchers.delete(ord.id);
       const safeOrderId = String(ord.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
       if (safeOrderId) {
-        await deleteVoucherFromPostgres(safeOrderId);
+        if (pgAvailable) {
+          try {
+            await deleteVoucherFromPostgres(safeOrderId);
+          } catch {
+            // Ignore PG delete warning
+          }
+        }
         const voucherPath = path.join(VOUCHERS_DIR, `${safeOrderId}.json`);
         try {
           if (fs.existsSync(voucherPath)) fs.unlinkSync(voucherPath);
@@ -2730,8 +2806,8 @@ async function startServer() {
     const now = new Date().toISOString();
     const orderId = `ORD-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
 
-    // Store voucher in private PostgreSQL table — NEVER exposed in public URLs!
-    await saveVoucherToPostgres({
+    // Store voucher in private storage — NEVER exposed in public URLs!
+    const voucherPayload = {
       orderId,
       userId: u.id,
       eventId: ev.id,
@@ -2739,7 +2815,21 @@ async function startServer() {
       reference: cleanRef,
       uploadedAt: now,
       dataUrl: rawVoucher,
-    });
+    };
+    memoryVouchers.set(orderId, { dataUrl: rawVoucher, uploadedAt: now });
+    try {
+      fs.mkdirSync(VOUCHERS_DIR, { recursive: true });
+      fs.writeFileSync(path.join(VOUCHERS_DIR, `${orderId}.json`), JSON.stringify(voucherPayload), 'utf8');
+    } catch {
+      // Ignore local file warning
+    }
+    if (pgAvailable) {
+      try {
+        await saveVoucherToPostgres(voucherPayload);
+      } catch (pgVoucherErr) {
+        console.warn('Warning: Could not save voucher to PostgreSQL (saved locally):', pgVoucherErr);
+      }
+    }
 
     const newOrder = {
       id: orderId,
@@ -2800,20 +2890,22 @@ async function startServer() {
     res.json({ order: newOrder, issuedTickets, emailDispatch });
   });
 
-  // Protected Private Voucher Endpoint (Backed by PostgreSQL vouchers table)
+  // Protected Private Voucher Endpoint (Backed by PostgreSQL vouchers table + local storage)
   app.get(
     '/api/admin/orders/:id/voucher',
     requirePermission('pending_vouchers', 'orders_payments'),
     async (req: AuthedRequest, res: Response) => {
       const orderId = String(req.params.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
-      try {
-        const pgVoucher = await getVoucherFromPostgres(orderId);
-        if (pgVoucher) {
-          res.json({ orderId, dataUrl: pgVoucher.dataUrl, uploadedAt: pgVoucher.uploadedAt });
-          return;
+      if (pgAvailable) {
+        try {
+          const pgVoucher = await getVoucherFromPostgres(orderId);
+          if (pgVoucher) {
+            res.json({ orderId, dataUrl: pgVoucher.dataUrl, uploadedAt: pgVoucher.uploadedAt });
+            return;
+          }
+        } catch (pgErr) {
+          console.warn('Warning: Error reading voucher from PostgreSQL:', pgErr);
         }
-      } catch (pgErr) {
-        console.warn('Warning: Error reading voucher from PostgreSQL:', pgErr);
       }
       const voucherPath = path.join(VOUCHERS_DIR, `${orderId}.json`);
       try {
@@ -4439,12 +4531,19 @@ async function startServer() {
   });
 
   // =========================================================
-  // SYSTEM BACKUP & MEMORY RESTORATION (PostgreSQL)
+  // SYSTEM BACKUP & MEMORY RESTORATION (PostgreSQL + Local)
   // =========================================================
   app.get('/api/admin/backup/export', requirePermission('settings'), async (req: AuthedRequest, res: Response) => {
-    recordSecurityAudit('BACKUP_EXPORTED', 'info', req, 'Copia de seguridad completa de PostgreSQL descargada por administrador.', req.user!.email);
+    recordSecurityAudit('BACKUP_EXPORTED', 'info', req, 'Copia de seguridad completa descargada por administrador.', req.user!.email);
     await persistDb();
-    const backupSnapshot = await exportFullPostgresBackup(db);
+    const backupSnapshot = pgAvailable
+      ? await exportFullPostgresBackup(db)
+      : {
+          ...db,
+          vouchers: loadLegacyVouchersFromDisk(VOUCHERS_DIR),
+          exportedAt: new Date().toISOString(),
+          storageEngine: 'LocalJSON',
+        };
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', `attachment; filename="lavuelta_pg_backup_${new Date().toISOString().slice(0, 10)}.json"`);
     res.send(JSON.stringify(backupSnapshot, null, 2));
@@ -4487,9 +4586,27 @@ async function startServer() {
       db.exchangeRate = { ...db.exchangeRate, ...backupData.exchangeRate };
     }
 
-    recordSecurityAudit('BACKUP_RESTORED', 'warning', req, `Sistema PostgreSQL restaurado desde copia de seguridad (Exportada: ${backupData.exportedAt || 'Fecha desconocida'}).`, req.user!.email);
-    await enqueuePostgresPersist(db, Array.isArray(backupData.vouchers) ? backupData.vouchers : [], true);
-    res.json({ ok: true, message: '¡Copia de seguridad restaurada con éxito en PostgreSQL! Todos los datos y comprobantes fueron reestablecidos.' });
+    recordSecurityAudit('BACKUP_RESTORED', 'warning', req, `Sistema restaurado desde copia de seguridad (Exportada: ${backupData.exportedAt || 'Fecha desconocida'}).`, req.user!.email);
+    saveLocalDbSnapshot();
+    if (Array.isArray(backupData.vouchers)) {
+      try {
+        fs.mkdirSync(VOUCHERS_DIR, { recursive: true });
+        for (const v of backupData.vouchers) {
+          if (v && v.orderId && v.dataUrl) {
+            const safeId = String(v.orderId).replace(/[^a-zA-Z0-9_-]/g, '');
+            if (safeId) {
+              fs.writeFileSync(path.join(VOUCHERS_DIR, `${safeId}.json`), JSON.stringify(v), 'utf8');
+            }
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+    if (pgAvailable) {
+      await enqueuePostgresPersist(db, Array.isArray(backupData.vouchers) ? backupData.vouchers : [], true);
+    }
+    res.json({ ok: true, message: '¡Copia de seguridad restaurada con éxito! Todos los datos y comprobantes fueron reestablecidos.' });
   });
 
   // =========================================================
@@ -4555,7 +4672,7 @@ async function startServer() {
   });
 
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LA VUELTA SESSIONS server listening on http://0.0.0.0:${PORT} (mode=${IS_PROD ? 'production' : 'development'}, storage=PostgreSQL)`);
+    console.log(`LA VUELTA SESSIONS server listening on http://0.0.0.0:${PORT} (mode=${IS_PROD ? 'production' : 'development'}, storage=${pgAvailable ? 'PostgreSQL+JSON' : 'LocalJSON'})`);
   });
 
   const shutdown = async (signal: string) => {

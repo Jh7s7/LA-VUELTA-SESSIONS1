@@ -20,6 +20,19 @@ let writeQueue: Promise<void> = Promise.resolve();
 
 let sslOverride: boolean | null = null;
 
+export function hasConfiguredDatabaseUrl(): boolean {
+  const raw = (
+    process.env.DATABASE_URL ||
+    process.env.INTERNAL_DATABASE_URL ||
+    process.env.EXTERNAL_DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRESQL_URL ||
+    process.env.PGHOST ||
+    ''
+  ).trim();
+  return Boolean(raw);
+}
+
 export function getDatabaseUrl(): string {
   const raw = (
     process.env.DATABASE_URL ||
@@ -38,13 +51,6 @@ export function getDatabaseUrl(): string {
     const port = (process.env.PGPORT || '5432').trim();
     const dbName = encodeURIComponent((process.env.PGDATABASE || 'lavueltasessions').trim());
     return `postgresql://${user}${pass}@${host}:${port}/${dbName}`;
-  }
-
-  if (process.env.RENDER) {
-    throw new Error(
-      'FATAL: La variable de entorno DATABASE_URL no está configurada en Render. ' +
-        'En tu panel de Render -> Web Service -> Environment, agrega DATABASE_URL con la Internal Database URL (o External Database URL) de tu base de datos PostgreSQL.'
-    );
   }
 
   return 'postgresql://postgres@127.0.0.1:5432/lavueltasessions';
