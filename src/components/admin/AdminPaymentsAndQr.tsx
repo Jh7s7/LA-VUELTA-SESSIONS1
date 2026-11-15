@@ -350,12 +350,61 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     }
   };
 
+  const [resendKeyInput, setResendKeyInput] = useState('');
+  const [emailFromInput, setEmailFromInput] = useState('');
+  const [savingEmailConfig, setSavingEmailConfig] = useState(false);
+  const [showEmailConfigBox, setShowEmailConfigBox] = useState(false);
+
+  const handleSaveEmailConfig = async () => {
+    setSavingEmailConfig(true);
+    try {
+      await apiRequest('POST', '/api/admin/email-config', {
+        resendApiKey: resendKeyInput.trim() || undefined,
+        emailFrom: emailFromInput.trim() || undefined,
+      });
+      onNotify(
+        'Configuración de envío de correo guardada en PostgreSQL. Ahora los QR se enviarán en vivo por SMTP.',
+        'success'
+      );
+      setResendKeyInput('');
+      setShowEmailConfigBox(false);
+      await onRefresh();
+    } catch (err: any) {
+      onNotify(err.message || 'Error al guardar configuración de correo.', 'error');
+    } finally {
+      setSavingEmailConfig(false);
+    }
+  };
+
+  const handleResetTicketStatus = async (ticketIdOrCode: string) => {
+    setTestingDoorValidation(true);
+    try {
+      const resp = await apiRequest<{ ok: boolean; ticket: TicketRecord }>(
+        'POST',
+        `/api/admin/tickets/${encodeURIComponent(ticketIdOrCode)}/reset`
+      );
+      setDoorTestFeedback({
+        tested: true,
+        allowed: true,
+        message: `Pase ${resp.ticket.code} restablecido a VÁLIDO (sin usar). Ya puedes volver a escanearlo con tu APK LK-Validador.`,
+        ticketCode: resp.ticket.code,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+      onNotify(`Ticket ${resp.ticket.code} reactivado y listo para escanear con LK-Validador.`, 'success');
+      await onRefresh();
+    } catch (err: any) {
+      onNotify(err.message || 'No se pudo restablecer el ticket.', 'error');
+    } finally {
+      setTestingDoorValidation(false);
+    }
+  };
+
   const handleQuickDoorValidation = async (codeOrPayload: string) => {
     setTestingDoorValidation(true);
     try {
       const resp = await apiRequest<{ allowed: boolean; log: AccessValidationLog }>(
         'POST',
-        '/api/validator/scan',
+        '/api/lk-validador/scan',
         { code: codeOrPayload }
       );
       setDoorTestFeedback({
@@ -871,13 +920,62 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowEmailConfigBox((v) => !v)}
+                className="inline-flex items-center gap-1.5 rounded-full border border-zinc-300 bg-zinc-100 px-3 py-1 text-[11px] font-semibold text-zinc-700 hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                <Mail className="h-3 w-3 text-[#E50914]" />
+                <span>{showEmailConfigBox ? 'Ocultar Config. Correo' : 'Configurar API Correo (Resend)'}</span>
+              </button>
               <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                Endpoint /api/tickets/resend activo
+                Enlace LK-Validador activo
               </span>
             </div>
           </div>
+
+          {showEmailConfigBox && (
+            <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 dark:bg-amber-500/10">
+              <p className="text-xs font-bold text-zinc-900 dark:text-white">
+                Activar Envío de Correos en Vivo a Compradores (Resend API)
+              </p>
+              <p className="mt-1 text-[11px] text-zinc-600 dark:text-zinc-300">
+                Al aprobar un pago o usar el simulador, el servidor genera todos los códigos QR firmados y los envía con imágenes PNG adjuntas al correo del comprador. Pega aquí tu clave <code className="font-mono">re_...</code> de Resend.com para activar el despacho real:
+              </p>
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-12">
+                <div className="sm:col-span-5">
+                  <input
+                    type="password"
+                    value={resendKeyInput}
+                    onChange={(e) => setResendKeyInput(e.target.value)}
+                    placeholder="RESEND_API_KEY (ej. re_123456789...)"
+                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                  />
+                </div>
+                <div className="sm:col-span-4">
+                  <input
+                    type="text"
+                    value={emailFromInput}
+                    onChange={(e) => setEmailFromInput(e.target.value)}
+                    placeholder="Remitente (opcional, ej. LA VUELTA <onboarding@resend.dev>)"
+                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                  />
+                </div>
+                <div className="sm:col-span-3">
+                  <button
+                    type="button"
+                    disabled={savingEmailConfig}
+                    onClick={handleSaveEmailConfig}
+                    className="w-full rounded-lg bg-zinc-900 px-3 py-2 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-900"
+                  >
+                    {savingEmailConfig ? 'Guardando...' : 'Guardar Conector'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
           <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-12">
             <div className="md:col-span-5">
@@ -952,7 +1050,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                   <span className="text-xs font-bold text-zinc-900 dark:text-white">
                     {emailTestResult.sentRealSmtp
                       ? 'Ticket Enviado vía SMTP'
-                      : 'Simulación de Ticket Exitosa'}
+                      : 'Simulación de Ticket Lista para Escaneo con APK'}
                   </span>
                   <span className="rounded bg-zinc-200 px-2 py-0.5 text-[10px] font-mono font-semibold dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300">
                     {emailTestResult.ticketCode}
@@ -984,28 +1082,67 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                     ) : (
                       <ShieldCheck className="h-3.5 w-3.5" />
                     )}
-                    <span>Probar Validación en Puerta con este QR</span>
+                    <span>Probar Validación en Puerta</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={testingDoorValidation}
+                    onClick={() =>
+                      handleResetTicketStatus(emailTestResult.ticketId || emailTestResult.ticketCode)
+                    }
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-semibold text-amber-700 hover:bg-amber-500/20 dark:text-amber-300 disabled:opacity-50"
+                    title="Vuelve a poner este ticket en estado VÁLIDO (sin usar) para re-escanearlo con tu APK"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    <span>Reactivar QR (Re-escanear con APK)</span>
                   </button>
                 </div>
               </div>
 
-              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3 text-xs">
-                <div>
-                  <span className="text-zinc-500">Destinatario:</span>
-                  <p className="font-semibold text-zinc-900 dark:text-white break-all">
-                    {emailTestResult.recipient}
-                  </p>
+              {/* Tarjeta QR en pantalla para escanear directamente desde el teléfono con la APK LK-Validador */}
+              <div className="mt-4 flex flex-col items-center gap-4 rounded-xl border border-zinc-200 bg-white p-4 sm:flex-row dark:border-zinc-800 dark:bg-zinc-950">
+                <div className="shrink-0 rounded-xl bg-white p-2 shadow-sm">
+                  <QrCodeBox payload={emailTestResult.qrPayload} size={150} />
                 </div>
-                <div>
-                  <span className="text-zinc-500">Asunto del Correo:</span>
-                  <p className="font-semibold text-zinc-900 dark:text-white truncate">
-                    {emailTestResult.subject}
+                <div className="flex-1 space-y-2 text-xs">
+                  <div className="inline-flex items-center gap-1.5 rounded-md bg-red-500/10 px-2.5 py-1 text-[11px] font-bold text-[#E50914]">
+                    <Smartphone className="h-3.5 w-3.5" />
+                    <span>ESCANEA ESTE QR CON TU APK LK-VALIDADOR</span>
+                  </div>
+                  <p className="text-zinc-600 dark:text-zinc-400">
+                    Apunta la cámara de tu teléfono con la APK hacia este código QR en pantalla para probar la validación en tiempo real contra el servidor.
                   </p>
-                </div>
-                <div>
-                  <span className="text-zinc-500">Estado Conector:</span>
-                  <p className="text-[11px] text-zinc-600 dark:text-zinc-400">
-                    {emailTestResult.providerNote || 'Pase emitido y listo para validación.'}
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 pt-1">
+                    <div>
+                      <span className="text-[11px] text-zinc-500">Código corto:</span>
+                      <p className="font-mono font-bold text-zinc-900 dark:text-white">
+                        {emailTestResult.ticketCode}
+                      </p>
+                    </div>
+                    <div>
+                      <span className="text-[11px] text-zinc-500">Destinatario correo:</span>
+                      <p className="font-semibold text-zinc-900 dark:text-white break-all">
+                        {emailTestResult.recipient}
+                      </p>
+                    </div>
+                  </div>
+                  <div>
+                    <span className="text-[11px] text-zinc-500">Payload Criptográfico HMAC (LK-Validador):</span>
+                    <div className="mt-0.5 flex items-center gap-2">
+                      <code className="rounded bg-zinc-100 px-2 py-1 font-mono text-[11px] text-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 break-all">
+                        {emailTestResult.qrPayload}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() => copyField('Payload QR', emailTestResult.qrPayload)}
+                        className="shrink-0 text-[11px] font-semibold text-[#E50914] hover:underline"
+                      >
+                        Copiar
+                      </button>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-zinc-500">
+                    {emailTestResult.providerNote}
                   </p>
                 </div>
               </div>
@@ -1096,6 +1233,17 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                       </td>
                       <td className="px-4 py-3 text-right">
                         <div className="flex items-center justify-end gap-2.5">
+                          {t.status === 'used' && (
+                            <button
+                              type="button"
+                              onClick={() => handleResetTicketStatus(t.id)}
+                              className="inline-flex items-center gap-1 text-xs font-semibold text-amber-600 hover:text-amber-700 dark:text-amber-400"
+                              title="Restablecer a Válido (sin usar) para volver a probar con la APK"
+                            >
+                              <RotateCcw className="h-3.5 w-3.5" />
+                              <span>Reactivar</span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => handleSendTicketEmail(t.id)}
@@ -1467,15 +1615,15 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
             <div className="rounded-xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900/60">
               <div className="flex items-center gap-2 text-sm font-semibold text-zinc-900 dark:text-white">
                 <ShieldCheck className="h-4 w-4 text-[#E50914]" />
-                <span>Rutas Activas del Servidor VALIDADOR</span>
+                <span>Rutas Activas del Servidor LK-VALIDADOR</span>
               </div>
               <p className="mt-1.5 text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
-                El servidor responde tanto a la aplicación móvil administrativa (con campos <code className="font-mono-tabular">correo</code> / <code className="font-mono-tabular">contraseña</code> y token Bearer) como a lectores externos mediante <code className="font-mono-tabular">X-LB-Api-Key</code>:
+                El servidor responde a tu APK <code className="font-mono-tabular">LK-Validador</code> (con campos <code className="font-mono-tabular">correo</code> / <code className="font-mono-tabular">contraseña</code>, token Bearer, <code className="font-mono-tabular">X-LK-Api-Key</code> o firma criptográfica <code className="font-mono-tabular">LVS1</code>):
               </p>
               <div className="mt-3 rounded-lg bg-zinc-100 p-3 font-mono-tabular text-[11px] text-zinc-800 dark:bg-zinc-950 dark:text-zinc-300">
-                POST /api/validator/login · POST /api/validador/login{'\n'}
-                GET  /api/validator/events · GET  /api/validator/ping{'\n'}
-                POST /api/validator/scan · POST /api/lb-validador/verify
+                POST /api/lk-validador/login · POST /api/validador/login{'\n'}
+                GET  /api/lk-validador/events · GET  /api/lk-validador/ping{'\n'}
+                POST /api/lk-validador/scan · POST /api/lk-validador/verify
               </div>
             </div>
 

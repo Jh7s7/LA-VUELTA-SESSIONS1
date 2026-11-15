@@ -1405,7 +1405,9 @@ async function startServer() {
       req.path.startsWith('/api/validator') ||
       req.path.startsWith('/api/validador') ||
       req.path.startsWith('/api/lb-validador') ||
-      req.path === '/api/tickets/validate';
+      req.path.startsWith('/api/lk-validador') ||
+      req.path.startsWith('/api/tickets/qr') ||
+      req.path.startsWith('/api/tickets/validate');
 
     if (origin) {
       const sameHost = origin.includes(req.headers.host || '');
@@ -1422,7 +1424,7 @@ async function startServer() {
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader(
           'Access-Control-Allow-Headers',
-          'Authorization, Content-Type, X-LB-Api-Key, X-Access-Token, Accept'
+          'Authorization, Content-Type, X-LB-Api-Key, X-LK-Api-Key, X-Api-Key, X-Access-Token, Accept'
         );
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
       }
@@ -1430,7 +1432,7 @@ async function startServer() {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Authorization, Content-Type, X-LB-Api-Key, X-Access-Token, Accept'
+        'Authorization, Content-Type, X-LB-Api-Key, X-LK-Api-Key, X-Api-Key, X-Access-Token, Accept'
       );
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     }
@@ -1478,7 +1480,13 @@ async function startServer() {
         res.status(429).json({ ok: false, error: `Demasiadas transacciones en curso. Espera ${rl.retryAfterSeconds} segundos para reintentar.` });
         return;
       }
-    } else if (req.path.includes('/tickets/validate') || req.path.includes('/validator/scan') || req.path.includes('/validador/')) {
+    } else if (
+      req.path.includes('/tickets/validate') ||
+      req.path.includes('/validator/scan') ||
+      req.path.includes('/validador/') ||
+      req.path.includes('/lk-validador/') ||
+      req.path.includes('/lb-validador/')
+    ) {
       const rl = checkGeneralRateLimit(`val:${ip}`, 60, 60 * 1000);
       if (!rl.allowed) {
         recordSecurityAudit('RATE_LIMIT_VALIDATION', 'high', req, 'Posible sondeo masivo de códigos QR detectado.');
@@ -1777,11 +1785,17 @@ async function startServer() {
     void handleCredentialLogin(req, res, false);
   });
 
-  // Dedicated login endpoints for LA VUELTA SESSIONS VALIDADOR mobile/external app
+  // Dedicated login endpoints for LA VUELTA SESSIONS VALIDADOR (LK / LB) mobile/external app
   app.post('/api/validator/login', (req: Request, res: Response) => {
     void handleCredentialLogin(req, res, true);
   });
   app.post('/api/validador/login', (req: Request, res: Response) => {
+    void handleCredentialLogin(req, res, true);
+  });
+  app.post('/api/lk-validador/login', (req: Request, res: Response) => {
+    void handleCredentialLogin(req, res, true);
+  });
+  app.post('/api/lb-validador/login', (req: Request, res: Response) => {
     void handleCredentialLogin(req, res, true);
   });
   app.post('/api/admin/login', (req: Request, res: Response) => {
@@ -2803,6 +2817,36 @@ async function startServer() {
     }
   );
 
+  // Public PNG QR endpoint so Gmail/Outlook/Apple Mail render ticket QR codes reliably
+  app.get('/api/tickets/qr/:identifier', async (req: Request, res: Response) => {
+    const raw = String(req.params.identifier || '').replace(/\.png$/i, '').trim();
+    const tk =
+      db.tickets.find(
+        (t) =>
+          t.id === raw ||
+          t.code.toUpperCase() === raw.toUpperCase() ||
+          t.qrPayload === raw
+      ) || null;
+    const payloadToRender = tk ? tk.qrPayload : raw.startsWith('LVS1.') ? raw : '';
+    if (!payloadToRender) {
+      res.status(404).send('QR no encontrado');
+      return;
+    }
+    try {
+      const pngBuffer = await QRCode.toBuffer(payloadToRender, {
+        type: 'png',
+        width: 340,
+        margin: 2,
+        color: { dark: '#000000', light: '#FFFFFF' },
+      });
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.send(pngBuffer);
+    } catch {
+      res.status(500).send('Error generando QR');
+    }
+  });
+
   function generateTicketEmailHtml(params: {
     ticket: any;
     event: any;
@@ -2810,18 +2854,44 @@ async function startServer() {
     appUrl: string;
     qrDataUrl: string;
     allTickets?: any[];
+    qrMap?: Record<string, string>;
+    useHostedQrUrl?: boolean;
   }): string {
-    const { ticket, event, recipientEmail, appUrl, qrDataUrl, allTickets } = params;
+    const { ticket, event, recipientEmail, appUrl, qrDataUrl, allTickets, qrMap, useHostedQrUrl } = params;
     const logoUrl = `${appUrl}/assets/lv-logo.png`;
-    const extraTicketsHtml =
-      Array.isArray(allTickets) && allTickets.length > 1
-        ? `<div style="margin-top:12px;padding-top:12px;border-top:1px dashed #D4D4D8;font-size:11px;color:#3F3F46;">
-             <strong>Pases incluidos en tu orden (${allTickets.length}):</strong><br>
-             ${allTickets
-               .map((tk) => `<span style="font-family:monospace;font-weight:700;">${tk.code}</span> (${tk.ticketType.toUpperCase()}${tk.seatLabel ? ` · ${tk.seatLabel}` : ''})`)
-               .join(' · ')}
-           </div>`
-        : '';
+    const ticketsList = Array.isArray(allTickets) && allTickets.length > 0 ? allTickets : [ticket];
+
+    const ticketsCardsHtml = ticketsList
+      .map((tk, idx) => {
+        const hostedUrl = `${appUrl}/api/tickets/qr/${encodeURIComponent(tk.code)}.png`;
+        const inlineUrl = qrMap?.[tk.id] || (idx === 0 ? qrDataUrl : '');
+        const imgSrc = useHostedQrUrl ? hostedUrl : inlineUrl || hostedUrl;
+        return `
+              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#FFFFFF;border-radius:16px;padding:24px;text-align:center;margin:0 0 16px 0;">
+                <tr>
+                  <td align="center">
+                    <div style="font-size:11px;font-weight:800;letter-spacing:1.5px;color:#E50914;text-transform:uppercase;margin-bottom:8px;">
+                      PASE #${tk.seq || idx + 1} DE ${ticketsList.length} · ${tk.ticketType === 'vip' ? 'EXPERIENCIA VIP' : 'LOCALIDAD GENERAL'}
+                    </div>
+                    ${
+                      imgSrc
+                        ? `<img src="${imgSrc}" alt="Código QR ${tk.code}" width="220" height="220" style="display:block;margin:0 auto;border-radius:8px;" />`
+                        : `<div style="font-family:monospace;font-size:13px;color:#000;background:#F4F4F5;padding:16px;border-radius:8px;">${tk.code}</div>`
+                    }
+                    <div style="margin-top:14px;font-family:monospace;font-size:16px;font-weight:800;letter-spacing:2px;color:#090B10;">
+                      ${tk.code}
+                    </div>
+                    <div style="margin-top:4px;font-size:11px;font-weight:600;color:#52525B;">
+                      ${tk.seatLabel ? `Ubicación: ${tk.seatLabel} · ` : ''}Titular: ${tk.userName || 'Comprador Oficial'}
+                    </div>
+                    <div style="margin-top:6px;font-family:monospace;font-size:10px;color:#71717A;word-break:break-all;">
+                      Token LK-Validador: ${tk.qrPayload}
+                    </div>
+                  </td>
+                </tr>
+              </table>`;
+      })
+      .join('');
 
     return `<!DOCTYPE html>
 <html lang="es">
@@ -2839,7 +2909,7 @@ async function startServer() {
             <td style="background:linear-gradient(135deg, #E50914 0%, #8A0000 100%);padding:28px 24px;text-align:center;">
               <img src="${logoUrl}" alt="LA VUELTA SESSIONS" width="64" height="64" style="display:block;margin:0 auto 12px auto;border-radius:50%;border:2px solid rgba(255,255,255,0.85);background-color:#09090B;object-fit:cover;" />
               <div style="font-size:11px;font-weight:800;letter-spacing:3px;color:#FFFFFF;text-transform:uppercase;margin-bottom:6px;">
-                PASE DIGITAL OFICIAL · ENTRADA ELECTRÓNICA
+                PASE DIGITAL OFICIAL · ENTRADA ELECTRÓNICA (${ticketsList.length} ${ticketsList.length === 1 ? 'ENTRADA' : 'ENTRADAS'})
               </div>
               <h1 style="margin:0;font-size:24px;font-weight:900;color:#FFFFFF;letter-spacing:-0.5px;">
                 LA VUELTA SESSIONS
@@ -2849,7 +2919,7 @@ async function startServer() {
           <tr>
             <td style="padding:28px 24px 20px 24px;">
               <span style="display:inline-block;background-color:rgba(229,9,20,0.15);border:1px solid rgba(229,9,20,0.35);color:#E50914;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">
-                ${ticket.ticketType === 'vip' ? 'ACCESO VIP PRIVILEGE' : 'ACCESO GENERAL'}
+                ${ticket.ticketType === 'vip' ? 'ACCESO VIP PRIVILEGE' : 'ACCESO OFICIAL AUTORIZADO'}
               </span>
               <h2 style="margin:0 0 8px 0;font-size:22px;font-weight:800;color:#FFFFFF;line-height:1.2;">
                 ${event.title}
@@ -2859,24 +2929,7 @@ async function startServer() {
                 📅 ${event.date || 'Fecha por confirmar'} · ⏰ ${event.time || '20:00'}
               </p>
 
-              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#FFFFFF;border-radius:16px;padding:24px;text-align:center;margin:0 0 20px 0;">
-                <tr>
-                  <td align="center">
-                    ${
-                      qrDataUrl
-                        ? `<img src="${qrDataUrl}" alt="Código QR del Ticket" width="220" height="220" style="display:block;margin:0 auto;border-radius:8px;" />`
-                        : `<div style="font-family:monospace;font-size:13px;color:#000;background:#F4F4F5;padding:16px;border-radius:8px;">${ticket.code}</div>`
-                    }
-                    <div style="margin-top:14px;font-family:monospace;font-size:15px;font-weight:800;letter-spacing:2px;color:#090B10;">
-                      ${ticket.code}
-                    </div>
-                    <div style="margin-top:4px;font-size:11px;font-weight:600;color:#52525B;">
-                      ${ticket.seatLabel ? `Asiento: ${ticket.seatLabel} · ` : ''}Pase Nominativo #${ticket.seq || 1}
-                    </div>
-                    ${extraTicketsHtml}
-                  </td>
-                </tr>
-              </table>
+              ${ticketsCardsHtml}
 
               <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:rgba(255,255,255,0.03);border:1px solid #27272A;border-radius:12px;padding:16px;margin-bottom:20px;">
                 <tr>
@@ -2888,8 +2941,8 @@ async function startServer() {
                   <td align="right" style="font-size:12px;font-weight:700;color:#FFFFFF;padding:4px 0;">${recipientEmail}</td>
                 </tr>
                 <tr>
-                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Estado en taquilla:</td>
-                  <td align="right" style="font-size:12px;font-weight:700;color:#10B981;padding:4px 0;">✓ Activo y Válido para Acceso</td>
+                  <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Estado en LK-Validador:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#10B981;padding:4px 0;">✓ Activo y Válido para Escaneo</td>
                 </tr>
                 <tr>
                   <td style="font-size:12px;color:#A1A1AA;padding:4px 0;">Firma de seguridad:</td>
@@ -2912,7 +2965,7 @@ async function startServer() {
           <tr>
             <td style="background-color:#0D0F16;border-top:1px solid #27272A;padding:20px 24px;text-align:center;font-size:11px;color:#71717A;line-height:1.6;">
               Presenta este código QR en tu dispositivo móvil o impreso al llegar a la puerta del evento.<br>
-              Pase personal e intransferible. Válido para un único escaneo en el sistema oficial.<br>
+              Pase personal e intransferible. Válido para un único escaneo en LK-Validador.<br>
               © ${new Date().getFullYear()} LA VUELTA SESSIONS · Todos los derechos reservados.
             </td>
           </tr>
@@ -2941,50 +2994,92 @@ async function startServer() {
       city: 'Maracay, Venezuela',
     };
 
-    let qrDataUrl = '';
-    try {
-      qrDataUrl = await QRCode.toDataURL(ticket.qrPayload, {
-        width: 320,
-        margin: 2,
-        color: { dark: '#000000', light: '#FFFFFF' },
-      });
-    } catch (err: any) {
-      console.warn('Warning generating QR data URL for email:', err);
+    const ticketsList = Array.isArray(allTickets) && allTickets.length > 0 ? allTickets : [ticket];
+    const qrMap: Record<string, string> = {};
+    const attachments: { filename: string; content: string }[] = [];
+
+    for (const tk of ticketsList) {
+      try {
+        const dUrl = await QRCode.toDataURL(tk.qrPayload, {
+          width: 320,
+          margin: 2,
+          color: { dark: '#000000', light: '#FFFFFF' },
+        });
+        qrMap[tk.id] = dUrl;
+        const base64Part = dUrl.split(',')[1];
+        if (base64Part) {
+          attachments.push({
+            filename: `Pase-QR-${tk.code}.png`,
+            content: base64Part,
+          });
+        }
+      } catch (err: any) {
+        console.warn('Warning generating QR data URL for email:', err);
+      }
     }
 
-    const emailSubject = `🎟️ Tu Pase Digital: ${event.title} [${ticket.code}]`;
+    const qrDataUrl = qrMap[ticket.id] || '';
+    const emailSubject =
+      ticketsList.length > 1
+        ? `🎟️ Tus ${ticketsList.length} Pases Digitales QR: ${event.title}`
+        : `🎟️ Tu Pase Digital QR: ${event.title} [${ticket.code}]`;
+
+    // Local preview HTML uses inline base64 DataURLs; real SMTP email uses hosted PNG URLs + PNG attachments for 100% Gmail compatibility
     const emailHtml = generateTicketEmailHtml({
       ticket,
       event,
       recipientEmail,
       appUrl,
       qrDataUrl,
-      allTickets,
+      allTickets: ticketsList,
+      qrMap,
+      useHostedQrUrl: false,
+    });
+    const smtpEmailHtml = generateTicketEmailHtml({
+      ticket,
+      event,
+      recipientEmail,
+      appUrl,
+      qrDataUrl,
+      allTickets: ticketsList,
+      qrMap,
+      useHostedQrUrl: true,
     });
 
-    const resendKey = getActiveResendKey();
+    const configuredResendKey = String((db.settings as any)?.resendApiKey || '').trim() || getActiveResendKey();
     let sentRealSmtp = false;
     let providerNote = '';
 
-    if (resendKey) {
+    if (configuredResendKey) {
       try {
-        const emailFrom = process.env.EMAIL_FROM || 'LA VUELTA SESSIONS <entradas@lavueltasessions.com>';
-        const rResp = await fetch('https://api.resend.com/emails', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${resendKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            from: emailFrom,
-            to: [recipientEmail],
-            subject: emailSubject,
-            html: emailHtml,
-          }),
-        });
+        const preferredFrom =
+          String((db.settings as any)?.emailFrom || process.env.EMAIL_FROM || '').trim() ||
+          'LA VUELTA SESSIONS <onboarding@resend.dev>';
+        const sendViaResend = async (fromAddr: string) =>
+          fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${configuredResendKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              from: fromAddr,
+              to: [recipientEmail],
+              subject: emailSubject,
+              html: smtpEmailHtml,
+              attachments,
+            }),
+          });
+
+        let rResp = await sendViaResend(preferredFrom);
+        if (!rResp.ok && !preferredFrom.includes('onboarding@resend.dev')) {
+          // Automatic fallback if custom domain is not verified yet in Resend
+          rResp = await sendViaResend('LA VUELTA SESSIONS <onboarding@resend.dev>');
+        }
+
         if (rResp.ok) {
           sentRealSmtp = true;
-          providerNote = 'Despachado exitosamente mediante Resend API.';
+          providerNote = `Enviado por correo real con ${attachments.length} QR(s) adjunto(s) mediante Resend API.`;
         } else {
           const errData = await rResp.text();
           providerNote = `Resend API HTTP ${rResp.status}: ${errData}`;
@@ -2994,7 +3089,7 @@ async function startServer() {
       }
     } else {
       providerNote =
-        'Simulación completada con éxito en entorno seguro. El pase y código QR firmado con HMAC están listos en la billetera digital y para el Validador de Puerta.';
+        'Modo Simulación Activo (Configura RESEND_API_KEY en el panel para envío SMTP en vivo). El código QR firmado con HMAC ya está activo en la base de datos y listo para escanear con LK-Validador.';
     }
 
     db.notificationLogs.unshift({
@@ -3026,6 +3121,7 @@ async function startServer() {
       providerNote,
       hmacVerified: check.signatureValid,
       ticket,
+      allTickets: ticketsList,
     };
   }
 
@@ -3433,12 +3529,73 @@ async function startServer() {
     return outcome;
   }
 
-  // Health / Ping endpoints for LA VUELTA SESSIONS VALIDADOR mobile app connection test
+  // Reset ticket status back to 'valid' (unused) so Admin can re-test scanning the same QR with the APK
+  app.post(
+    '/api/admin/tickets/:id/reset',
+    requirePermission('tickets_qr', 'validator', 'orders_payments'),
+    async (req: AuthedRequest, res: Response) => {
+      const tk = db.tickets.find(
+        (t) => t.id === req.params.id || t.code.toUpperCase() === String(req.params.id || '').toUpperCase()
+      );
+      if (!tk) {
+        res.status(404).json({ error: 'Ticket no encontrado.' });
+        return;
+      }
+      tk.status = 'valid';
+      delete tk.usedAt;
+      delete tk.validatedBy;
+      appendAudit(
+        req.user!,
+        'RESET_TICKET_STATUS',
+        'ticket',
+        tk.id,
+        `Ticket ${tk.code} restablecido a estado VÁLIDO (sin usar) para prueba con APK LK-Validador`
+      );
+      await persistDb();
+      res.json({ ok: true, ticket: tk });
+    }
+  );
+
+  // Configure Resend API Key & Email From directly from Admin Panel (persisted in PostgreSQL)
+  app.post(
+    '/api/admin/email-config',
+    requirePermission('tickets_qr', 'settings', 'notifications'),
+    async (req: AuthedRequest, res: Response) => {
+      const { resendApiKey, emailFrom } = req.body || {};
+      if (resendApiKey !== undefined) {
+        const cleanKey = String(resendApiKey || '').trim();
+        if (cleanKey && !cleanKey.startsWith('re_')) {
+          res.status(400).json({ error: 'La API Key de Resend debe comenzar con "re_".' });
+          return;
+        }
+        (db.settings as any).resendApiKey = cleanKey;
+      }
+      if (emailFrom !== undefined) {
+        (db.settings as any).emailFrom = String(emailFrom || '').trim().slice(0, 120);
+      }
+      appendAudit(
+        req.user!,
+        'UPDATE_EMAIL_CONFIG',
+        'settings',
+        'email',
+        `Configuración de correo actualizada (Proveedor activo: ${Boolean((db.settings as any).resendApiKey || getActiveResendKey())})`
+      );
+      await persistDb();
+      res.json({
+        ok: true,
+        emailProviderConfigured: Boolean((db.settings as any).resendApiKey || getActiveResendKey()),
+        emailFrom: (db.settings as any).emailFrom || process.env.EMAIL_FROM || 'LA VUELTA SESSIONS <onboarding@resend.dev>',
+      });
+    }
+  );
+
+  // Health / Ping endpoints for LA VUELTA SESSIONS VALIDADOR (LK / LB) mobile app connection test
   const handleValidatorPing = (req: Request, res: Response) => {
     res.json({
       ok: true,
+      success: true,
       status: 'online',
-      app: 'LA VUELTA SESSIONS',
+      app: 'LA VUELTA SESSIONS · LK-VALIDADOR',
       validatorReady: true,
       serverUrl: `${(req.headers['x-forwarded-proto'] as string) || req.protocol}://${req.headers.host}`,
       timestamp: new Date().toISOString(),
@@ -3448,11 +3605,13 @@ async function startServer() {
   app.get('/api/health', handleValidatorPing);
   app.get('/api/validator/ping', handleValidatorPing);
   app.get('/api/validador/ping', handleValidatorPing);
+  app.get('/api/lk-validador/ping', handleValidatorPing);
+  app.get('/api/lb-validador/ping', handleValidatorPing);
 
-  // Events list + door counters for connected VALIDADOR mobile app
+  // Events list + door counters for connected VALIDADOR (LK / LB) mobile app
   const handleValidatorEvents = (req: AuthedRequest, res: Response) => {
-    const configuredKey = getActiveLbApiKey();
-    const headerKey = req.headers['x-lb-api-key'];
+    const configuredKey = (process.env.LK_VALIDADOR_API_KEY || '').trim() || getActiveLbApiKey();
+    const headerKey = req.headers['x-lk-api-key'] || req.headers['x-lb-api-key'] || req.headers['x-api-key'];
     const hasStaffPerm = req.user && getEffectivePermissions(req.user).includes('validator');
     if (!hasStaffPerm && (!configuredKey || headerKey !== configuredKey)) {
       res.status(403).json({ ok: false, error: 'Acceso solo para administradores y personal de puerta.' });
@@ -3475,26 +3634,18 @@ async function startServer() {
           unusedValidTicketsCount: st?.unusedValidTicketsCount ?? 0,
         };
       });
-    res.json({ ok: true, events: items, recentLogs: db.accessLogs.slice(0, 25) });
+    res.json({ ok: true, success: true, events: items, recentLogs: db.accessLogs.slice(0, 25) });
   };
   app.get('/api/validator/events', handleValidatorEvents);
   app.get('/api/validador/events', handleValidatorEvents);
+  app.get('/api/lk-validador/events', handleValidatorEvents);
+  app.get('/api/lb-validador/events', handleValidatorEvents);
 
-  // Unified Atomic Scan Handler for Web Console + Mobile VALIDADOR App + External LB Validador
+  // Unified Atomic Scan Handler for Web Console + Mobile APK LK-VALIDADOR + External LB Validador
   const handleUnifiedValidatorScan = async (req: AuthedRequest, res: Response) => {
-    const configuredKey = getActiveLbApiKey();
-    const headerKey = req.headers['x-lb-api-key'];
+    const configuredKey = (process.env.LK_VALIDADOR_API_KEY || '').trim() || getActiveLbApiKey();
+    const headerKey = req.headers['x-lk-api-key'] || req.headers['x-lb-api-key'] || req.headers['x-api-key'];
     const hasStaffPerm = req.user && getEffectivePermissions(req.user).includes('validator');
-
-    if (!hasStaffPerm && (!configuredKey || headerKey !== configuredKey)) {
-      res.status(403).json({
-        ok: false,
-        allowed: false,
-        valid: false,
-        error: 'Acceso solo para administradores. Inicia sesión en el Validador o configura LB_VALIDADOR_API_KEY.',
-      });
-      return;
-    }
 
     const rawCode = String(
       req.body?.code ??
@@ -3504,22 +3655,44 @@ async function startServer() {
         req.body?.codigo ??
         req.body?.ticketCode ??
         req.body?.payload ??
+        req.body?.token ??
+        req.query?.code ??
+        req.query?.qr ??
+        req.params?.code ??
         ''
     ).trim();
-    const eventFilterId = String(req.body?.eventId ?? req.body?.eventoId ?? '').trim();
-    if (!rawCode) {
-      res.status(400).json({ ok: false, error: 'Proporciona o escanea un código QR.' });
+
+    // Allow authenticated staff, valid API key, OR direct cryptographic LVS1.<id>.<hmac> scan from APK
+    const isSignedLvsPayload = rawCode.startsWith('LVS1.');
+    if (!hasStaffPerm && (!configuredKey || headerKey !== configuredKey) && !isSignedLvsPayload) {
+      res.status(403).json({
+        ok: false,
+        success: false,
+        allowed: false,
+        valid: false,
+        error: 'Acceso solo para administradores. Inicia sesión en LK-Validador o escanea un QR firmado LVS1.',
+      });
       return;
     }
-    const operator = req.user?.name || String(req.body?.deviceLabel || 'App Validador');
+
+    const eventFilterId = String(req.body?.eventId ?? req.body?.eventoId ?? req.query?.eventId ?? '').trim();
+    if (!rawCode) {
+      res.status(400).json({ ok: false, success: false, error: 'Proporciona o escanea un código QR.' });
+      return;
+    }
+    const operator = req.user?.name || String(req.body?.deviceLabel || req.body?.operator || 'APK LK-Validador');
     const result = await executeAtomicScan(rawCode, eventFilterId, operator, req.user);
     res.json({
       ...result,
       ok: result.allowed,
+      success: result.allowed,
       valid: result.allowed,
+      valido: result.allowed,
       result: result.log?.result,
       status: result.log?.result,
+      estado: result.log?.result,
       message: result.log?.message,
+      mensaje: result.log?.message,
     });
   };
 
@@ -3527,8 +3700,16 @@ async function startServer() {
   app.post('/api/validator/validate', handleUnifiedValidatorScan);
   app.post('/api/validador/scan', handleUnifiedValidatorScan);
   app.post('/api/validador/validar', handleUnifiedValidatorScan);
+  app.post('/api/validador/validate', handleUnifiedValidatorScan);
+  app.post('/api/lk-validador/scan', handleUnifiedValidatorScan);
+  app.post('/api/lk-validador/validate', handleUnifiedValidatorScan);
+  app.post('/api/lk-validador/verify', handleUnifiedValidatorScan);
+  app.post('/api/lk-validador/validar', handleUnifiedValidatorScan);
+  app.get('/api/lk-validador/verify', handleUnifiedValidatorScan);
   app.post('/api/tickets/validate', handleUnifiedValidatorScan);
+  app.get('/api/tickets/validate/:code', handleUnifiedValidatorScan);
   app.post('/api/lb-validador/verify', handleUnifiedValidatorScan);
+  app.post('/api/lb-validador/scan', handleUnifiedValidatorScan);
 
   // =========================================================
   // MODULE 7: BIRTHDAYS OF THE MONTH (With Feb 29 & Privacy)
