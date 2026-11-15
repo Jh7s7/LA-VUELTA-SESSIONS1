@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import tls from 'tls';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import QRCode from 'qrcode';
@@ -2771,16 +2772,32 @@ async function startServer() {
     };
 
     db.orders.unshift(newOrder);
+
+    // Issue QR tickets immediately upon purchase so buyer receives their QR pass right away in email and wallet
+    const issuedTickets = issueTicketsForOrder(newOrder, now);
+    const appUrl = `${(req.headers['x-forwarded-proto'] as string) || req.protocol}://${req.headers.host}`;
+    const buyerEmail = String(newOrder.payerEmail || newOrder.userEmail || '').trim().toLowerCase();
+    let emailDispatch = null;
+    if (issuedTickets.length > 0 && buyerEmail) {
+      emailDispatch = await dispatchTicketEmailOrSimulate({
+        ticket: issuedTickets[0],
+        allTickets: issuedTickets,
+        recipientEmail: buyerEmail,
+        appUrl,
+        triggeredBy: u.email,
+      });
+    }
+
     recordSecurityAudit(
       'ORDER_PAYMENT_REPORTED',
       'info',
       req,
-      `Orden ${newOrder.id} (${newOrder.ticketType.toUpperCase()} x${newOrder.qty}) registrada · Ref: ${cleanRef} · Total: $${newOrder.totalAmount} · Método: ${method}`,
+      `Orden ${newOrder.id} (${newOrder.ticketType.toUpperCase()} x${newOrder.qty}) registrada y ${issuedTickets.length} QR emitidos · Ref: ${cleanRef} · Correo: ${buyerEmail}`,
       u.email
     );
     await persistDb();
 
-    res.json({ order: newOrder });
+    res.json({ order: newOrder, issuedTickets, emailDispatch });
   });
 
   // Protected Private Voucher Endpoint (Backed by PostgreSQL vouchers table)
@@ -2856,8 +2873,9 @@ async function startServer() {
     allTickets?: any[];
     qrMap?: Record<string, string>;
     useHostedQrUrl?: boolean;
+    useCidQr?: boolean;
   }): string {
-    const { ticket, event, recipientEmail, appUrl, qrDataUrl, allTickets, qrMap, useHostedQrUrl } = params;
+    const { ticket, event, recipientEmail, appUrl, qrDataUrl, allTickets, qrMap, useHostedQrUrl, useCidQr } = params;
     const logoUrl = `${appUrl}/assets/lv-logo.png`;
     const ticketsList = Array.isArray(allTickets) && allTickets.length > 0 ? allTickets : [ticket];
 
@@ -2865,7 +2883,8 @@ async function startServer() {
       .map((tk, idx) => {
         const hostedUrl = `${appUrl}/api/tickets/qr/${encodeURIComponent(tk.code)}.png`;
         const inlineUrl = qrMap?.[tk.id] || (idx === 0 ? qrDataUrl : '');
-        const imgSrc = useHostedQrUrl ? hostedUrl : inlineUrl || hostedUrl;
+        const cidUrl = `cid:qr_${idx}`;
+        const imgSrc = useCidQr ? cidUrl : useHostedQrUrl ? hostedUrl : inlineUrl || hostedUrl;
         return `
               <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#FFFFFF;border-radius:16px;padding:24px;text-align:center;margin:0 0 16px 0;">
                 <tr>
@@ -2977,6 +2996,181 @@ async function startServer() {
 </html>`;
   }
 
+  function issueTicketsForOrder(order: any, nowIso?: string): any[] {
+    const existing = db.tickets.filter((t) => t.orderId === order.id);
+    if (existing.length > 0) {
+      return existing;
+    }
+    const now = nowIso || new Date().toISOString();
+    const vipCount =
+      order.vipQty !== undefined ? Number(order.vipQty) : order.ticketType === 'vip' ? Number(order.qty) : 0;
+    const genCount =
+      order.generalQty !== undefined
+        ? Number(order.generalQty)
+        : order.ticketType === 'general'
+        ? Number(order.qty)
+        : 0;
+
+    const seatsList: string[] = Array.isArray(order.selectedSeats) ? order.selectedSeats : [];
+    const vipSeats = seatsList.filter((s) => s.startsWith('VIP-'));
+    const genSeats = seatsList.filter((s) => s.startsWith('GEN-'));
+
+    const tiersToIssue: { tier: 'vip' | 'general'; seatLabel?: string }[] = [];
+    for (let v = 0; v < vipCount; v++) {
+      tiersToIssue.push({ tier: 'vip', seatLabel: vipSeats[v] });
+    }
+    for (let g = 0; g < genCount; g++) {
+      tiersToIssue.push({ tier: 'general', seatLabel: genSeats[g] });
+    }
+    if (tiersToIssue.length === 0) {
+      for (let k = 0; k < Number(order.qty || 1); k++) {
+        tiersToIssue.push({ tier: order.ticketType === 'vip' ? 'vip' : 'general', seatLabel: seatsList[k] });
+      }
+    }
+
+    const issuedTickets = [];
+    for (let idx = 0; idx < tiersToIssue.length; idx++) {
+      const seq = idx + 1;
+      const spec = tiersToIssue[idx];
+      const ticketId = `tk_${crypto.randomBytes(8).toString('hex')}`;
+      const humanCode = `LV-${crypto.randomBytes(4).toString('hex').toUpperCase()}-${seq}`;
+      const qrPayload = signTicketQr(ticketId, order.eventId);
+
+      const tk = {
+        id: ticketId,
+        code: humanCode,
+        qrPayload,
+        orderId: order.id,
+        userId: order.userId,
+        userName: order.userName,
+        eventId: order.eventId,
+        eventTitle: order.eventTitle,
+        ticketType: spec.tier,
+        seatLabel: spec.seatLabel,
+        seq,
+        status: 'valid',
+        createdAt: now,
+      };
+      db.tickets.unshift(tk);
+      issuedTickets.push(tk);
+    }
+    return issuedTickets;
+  }
+
+  async function sendEmailViaNativeGmailSmtp(params: {
+    gmailUser: string;
+    gmailAppPassword: string;
+    to: string;
+    subject: string;
+    html: string;
+    attachments: { filename: string; content: string }[];
+  }): Promise<{ ok: boolean; note: string }> {
+    const cleanUser = params.gmailUser.trim();
+    const cleanPass = params.gmailAppPassword.replace(/\s+/g, '').trim();
+    const cleanTo = params.to.trim();
+
+    return new Promise((resolve) => {
+      const boundary = `----=_Part_LVS_${crypto.randomBytes(8).toString('hex')}`;
+      const encodedSubject = `=?UTF-8?B?${Buffer.from(params.subject, 'utf8').toString('base64')}?=`;
+      const htmlBase64 = (Buffer.from(params.html, 'utf8').toString('base64').match(/.{1,76}/g) || []).join('\r\n');
+
+      const mimeLines: string[] = [
+        `From: "LA VUELTA SESSIONS" <${cleanUser}>`,
+        `To: <${cleanTo}>`,
+        `Subject: ${encodedSubject}`,
+        `Date: ${new Date().toUTCString()}`,
+        `Message-ID: <${crypto.randomBytes(12).toString('hex')}@lavueltasessions.com>`,
+        `MIME-Version: 1.0`,
+        `Content-Type: multipart/related; boundary="${boundary}"`,
+        ``,
+        `--${boundary}`,
+        `Content-Type: text/html; charset="UTF-8"`,
+        `Content-Transfer-Encoding: base64`,
+        ``,
+        htmlBase64,
+      ];
+
+      params.attachments.forEach((att, idx) => {
+        const chunked = (att.content.match(/.{1,76}/g) || []).join('\r\n');
+        mimeLines.push(
+          `--${boundary}`,
+          `Content-Type: image/png; name="${att.filename}"`,
+          `Content-Transfer-Encoding: base64`,
+          `Content-ID: <qr_${idx}>`,
+          `Content-Disposition: inline; filename="${att.filename}"`,
+          ``,
+          chunked
+        );
+      });
+      mimeLines.push(`--${boundary}--`, ``, `.`);
+      const mimeBody = mimeLines.join('\r\n');
+
+      const socket = tls.connect(
+        { host: 'smtp.gmail.com', port: 465, servername: 'smtp.gmail.com', timeout: 12000 },
+        () => {}
+      );
+
+      let step = 0;
+      let buffer = '';
+      let finished = false;
+      const finish = (ok: boolean, note: string) => {
+        if (finished) return;
+        finished = true;
+        try {
+          socket.destroy();
+        } catch {}
+        resolve({ ok, note });
+      };
+
+      socket.setTimeout(12000, () => finish(false, 'Tiempo de espera agotado conectando a smtp.gmail.com:465'));
+      socket.on('error', (err) => finish(false, `Error TLS Gmail SMTP: ${err.message}`));
+
+      socket.on('data', (chunk) => {
+        buffer += chunk.toString('utf8');
+        const lines = buffer.split('\r\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!/^\d{3} /.test(line)) continue;
+          const code = Number(line.slice(0, 3));
+          if (code >= 400) {
+            finish(false, `Gmail SMTP respondió (${code}): ${line}`);
+            return;
+          }
+          if (step === 0 && code === 220) {
+            step = 1;
+            socket.write('EHLO lavueltasessions.com\r\n');
+          } else if (step === 1 && code === 250) {
+            step = 2;
+            socket.write('AUTH LOGIN\r\n');
+          } else if (step === 2 && code === 334) {
+            step = 3;
+            socket.write(Buffer.from(cleanUser, 'utf8').toString('base64') + '\r\n');
+          } else if (step === 3 && code === 334) {
+            step = 4;
+            socket.write(Buffer.from(cleanPass, 'utf8').toString('base64') + '\r\n');
+          } else if (step === 4 && code === 235) {
+            step = 5;
+            socket.write(`MAIL FROM:<${cleanUser}>\r\n`);
+          } else if (step === 5 && code === 250) {
+            step = 6;
+            socket.write(`RCPT TO:<${cleanTo}>\r\n`);
+          } else if (step === 6 && code === 250) {
+            step = 7;
+            socket.write('DATA\r\n');
+          } else if (step === 7 && code === 354) {
+            step = 8;
+            socket.write(mimeBody + '\r\n');
+          } else if (step === 8 && code === 250) {
+            step = 9;
+            socket.write('QUIT\r\n');
+            finish(true, `Enviado exitosamente a la bandeja de ${cleanTo} desde Gmail (${cleanUser}).`);
+          }
+        }
+      });
+    });
+  }
+
   async function dispatchTicketEmailOrSimulate(params: {
     ticket: any;
     allTickets?: any[];
@@ -3024,7 +3218,7 @@ async function startServer() {
         ? `🎟️ Tus ${ticketsList.length} Pases Digitales QR: ${event.title}`
         : `🎟️ Tu Pase Digital QR: ${event.title} [${ticket.code}]`;
 
-    // Local preview HTML uses inline base64 DataURLs; real SMTP email uses hosted PNG URLs + PNG attachments for 100% Gmail compatibility
+    // Local preview HTML uses inline base64 DataURLs; Gmail SMTP uses cid:qr_N inline MIME + PNG attachments; Resend uses hosted PNG URLs + PNG attachments
     const emailHtml = generateTicketEmailHtml({
       ticket,
       event,
@@ -3034,6 +3228,18 @@ async function startServer() {
       allTickets: ticketsList,
       qrMap,
       useHostedQrUrl: false,
+      useCidQr: false,
+    });
+    const gmailCidEmailHtml = generateTicketEmailHtml({
+      ticket,
+      event,
+      recipientEmail,
+      appUrl,
+      qrDataUrl,
+      allTickets: ticketsList,
+      qrMap,
+      useHostedQrUrl: false,
+      useCidQr: true,
     });
     const smtpEmailHtml = generateTicketEmailHtml({
       ticket,
@@ -3044,13 +3250,38 @@ async function startServer() {
       allTickets: ticketsList,
       qrMap,
       useHostedQrUrl: true,
+      useCidQr: false,
     });
 
+    const gmailUser = String((db.settings as any)?.gmailUser || process.env.GMAIL_USER || process.env.SMTP_USER || '').trim();
+    const gmailAppPassword = String(
+      (db.settings as any)?.gmailAppPassword || process.env.GMAIL_APP_PASSWORD || process.env.SMTP_PASS || ''
+    ).trim();
     const configuredResendKey = String((db.settings as any)?.resendApiKey || '').trim() || getActiveResendKey();
+
     let sentRealSmtp = false;
     let providerNote = '';
 
-    if (configuredResendKey) {
+    // 1. Try Native Gmail SMTP first if configured (sends to ANY buyer email without domain restrictions!)
+    if (gmailUser && gmailAppPassword) {
+      const gmailResult = await sendEmailViaNativeGmailSmtp({
+        gmailUser,
+        gmailAppPassword,
+        to: recipientEmail,
+        subject: emailSubject,
+        html: gmailCidEmailHtml,
+        attachments,
+      });
+      if (gmailResult.ok) {
+        sentRealSmtp = true;
+        providerNote = gmailResult.note;
+      } else {
+        providerNote = gmailResult.note;
+      }
+    }
+
+    // 2. Try Resend API if not yet sent via Gmail
+    if (!sentRealSmtp && configuredResendKey) {
       try {
         const preferredFrom =
           String((db.settings as any)?.emailFrom || process.env.EMAIL_FROM || '').trim() ||
@@ -3073,7 +3304,6 @@ async function startServer() {
 
         let rResp = await sendViaResend(preferredFrom);
         if (!rResp.ok && !preferredFrom.includes('onboarding@resend.dev')) {
-          // Automatic fallback if custom domain is not verified yet in Resend
           rResp = await sendViaResend('LA VUELTA SESSIONS <onboarding@resend.dev>');
         }
 
@@ -3082,14 +3312,18 @@ async function startServer() {
           providerNote = `Enviado por correo real con ${attachments.length} QR(s) adjunto(s) mediante Resend API.`;
         } else {
           const errData = await rResp.text();
-          providerNote = `Resend API HTTP ${rResp.status}: ${errData}`;
+          providerNote = providerNote
+            ? `${providerNote} · Resend HTTP ${rResp.status}: ${errData}`
+            : `Resend API HTTP ${rResp.status}: ${errData}`;
         }
       } catch (err: any) {
         providerNote = `Fallo en el conector SMTP/Resend: ${err.message}`;
       }
-    } else {
+    }
+
+    if (!sentRealSmtp && !providerNote) {
       providerNote =
-        'Modo Simulación Activo (Configura RESEND_API_KEY en el panel para envío SMTP en vivo). El código QR firmado con HMAC ya está activo en la base de datos y listo para escanear con LK-Validador.';
+        'Entrada QR generada y mostrada en pantalla. Para que también llegue directo a la bandeja de entrada de Gmail de cualquier comprador, configura tu Correo Gmail + Contraseña de Aplicación (16 letras) en el botón "Configurar Envío de Correo".';
     }
 
     db.notificationLogs.unshift({
@@ -3125,7 +3359,7 @@ async function startServer() {
     };
   }
 
-  // Approve Order -> Issue Unique Cryptographic QR Tickets & Automatically Dispatch/Simulate Ticket Email!
+  // Approve Order -> Issue/Confirm Unique Cryptographic QR Tickets & Automatically Dispatch/Simulate Ticket Email!
   app.post(
     '/api/admin/orders/:id/approve',
     requirePermission('pending_vouchers', 'orders_payments'),
@@ -3135,16 +3369,10 @@ async function startServer() {
         res.status(404).json({ error: 'Orden no encontrada.' });
         return;
       }
-      if (order.status !== 'pending') {
+      if (order.status === 'rejected' || order.status === 'refunded') {
         res.status(409).json({
           error: `Esta orden ya fue procesada anteriormente (estado actual: ${order.status}).`,
         });
-        return;
-      }
-
-      // Guard against duplicate ticket generation
-      if (db.tickets.some((t) => t.orderId === order.id)) {
-        res.status(409).json({ error: 'Los tickets de esta orden ya fueron emitidos.' });
         return;
       }
 
@@ -3155,59 +3383,7 @@ async function startServer() {
       order.reviewNotes = String(req.body?.notes || 'Comprobante verificado y aprobado.').slice(0, 250);
       order.updatedAt = now;
 
-      const vipCount =
-        order.vipQty !== undefined ? Number(order.vipQty) : order.ticketType === 'vip' ? Number(order.qty) : 0;
-      const genCount =
-        order.generalQty !== undefined
-          ? Number(order.generalQty)
-          : order.ticketType === 'general'
-          ? Number(order.qty)
-          : 0;
-
-      const seatsList: string[] = Array.isArray(order.selectedSeats) ? order.selectedSeats : [];
-      const vipSeats = seatsList.filter((s) => s.startsWith('VIP-'));
-      const genSeats = seatsList.filter((s) => s.startsWith('GEN-'));
-
-      const tiersToIssue: { tier: 'vip' | 'general'; seatLabel?: string }[] = [];
-      for (let v = 0; v < vipCount; v++) {
-        tiersToIssue.push({ tier: 'vip', seatLabel: vipSeats[v] });
-      }
-      for (let g = 0; g < genCount; g++) {
-        tiersToIssue.push({ tier: 'general', seatLabel: genSeats[g] });
-      }
-      // Fallback safety if legacy order had neither
-      if (tiersToIssue.length === 0) {
-        for (let k = 0; k < Number(order.qty || 1); k++) {
-          tiersToIssue.push({ tier: order.ticketType === 'vip' ? 'vip' : 'general', seatLabel: seatsList[k] });
-        }
-      }
-
-      const issuedTickets = [];
-      for (let idx = 0; idx < tiersToIssue.length; idx++) {
-        const seq = idx + 1;
-        const spec = tiersToIssue[idx];
-        const ticketId = `tk_${crypto.randomBytes(8).toString('hex')}`;
-        const humanCode = `LV-${crypto.randomBytes(4).toString('hex').toUpperCase()}-${seq}`;
-        const qrPayload = signTicketQr(ticketId, order.eventId);
-
-        const tk = {
-          id: ticketId,
-          code: humanCode,
-          qrPayload,
-          orderId: order.id,
-          userId: order.userId,
-          userName: order.userName,
-          eventId: order.eventId,
-          eventTitle: order.eventTitle,
-          ticketType: spec.tier,
-          seatLabel: spec.seatLabel,
-          seq,
-          status: 'valid',
-          createdAt: now,
-        };
-        db.tickets.unshift(tk);
-        issuedTickets.push(tk);
-      }
+      const issuedTickets = issueTicketsForOrder(order, now);
 
       const appUrl = `${(req.headers['x-forwarded-proto'] as string) || req.protocol}://${req.headers.host}`;
       const buyerEmail = String(order.payerEmail || order.userEmail || '').trim().toLowerCase();
@@ -3474,11 +3650,10 @@ async function startServer() {
       }
 
       const parentOrder = db.orders.find((o) => o.id === tk.orderId);
-      const isDemoOrder = tk.orderId?.startsWith('ORD-DEMO-');
-      if ((!parentOrder && !isDemoOrder) || (parentOrder && parentOrder.status !== 'approved')) {
+      if (parentOrder && (parentOrder.status === 'rejected' || parentOrder.status === 'refunded')) {
         outcome = {
           allowed: false,
-          log: await recordAccess('PAGO_NO_APROBADO', 'La orden asociada no tiene un pago confirmado.', tk),
+          log: await recordAccess('PAGO_NO_APROBADO', 'La orden asociada fue rechazada o reembolsada.', tk),
         };
         return;
       }
@@ -3556,12 +3731,38 @@ async function startServer() {
     }
   );
 
-  // Configure Resend API Key & Email From directly from Admin Panel (persisted in PostgreSQL)
+  // Configure Gmail SMTP (User + App Password) or Resend API Key directly from Admin Panel (persisted in PostgreSQL)
+  app.get(
+    '/api/admin/email-config',
+    requirePermission('tickets_qr', 'settings', 'notifications'),
+    (_req: AuthedRequest, res: Response) => {
+      const gmailUser = String((db.settings as any)?.gmailUser || process.env.GMAIL_USER || '').trim();
+      const gmailConfigured = Boolean(
+        gmailUser && ((db.settings as any)?.gmailAppPassword || process.env.GMAIL_APP_PASSWORD)
+      );
+      const resendConfigured = Boolean((db.settings as any)?.resendApiKey || getActiveResendKey());
+      res.json({
+        ok: true,
+        gmailConfigured,
+        gmailUser,
+        resendConfigured,
+        emailProviderConfigured: gmailConfigured || resendConfigured,
+        emailFrom: (db.settings as any)?.emailFrom || process.env.EMAIL_FROM || 'LA VUELTA SESSIONS <onboarding@resend.dev>',
+      });
+    }
+  );
+
   app.post(
     '/api/admin/email-config',
     requirePermission('tickets_qr', 'settings', 'notifications'),
     async (req: AuthedRequest, res: Response) => {
-      const { resendApiKey, emailFrom } = req.body || {};
+      const { gmailUser, gmailAppPassword, resendApiKey, emailFrom } = req.body || {};
+      if (gmailUser !== undefined) {
+        (db.settings as any).gmailUser = String(gmailUser || '').trim().toLowerCase().slice(0, 120);
+      }
+      if (gmailAppPassword !== undefined) {
+        (db.settings as any).gmailAppPassword = String(gmailAppPassword || '').replace(/\s+/g, '').trim().slice(0, 64);
+      }
       if (resendApiKey !== undefined) {
         const cleanKey = String(resendApiKey || '').trim();
         if (cleanKey && !cleanKey.startsWith('re_')) {
@@ -3573,17 +3774,22 @@ async function startServer() {
       if (emailFrom !== undefined) {
         (db.settings as any).emailFrom = String(emailFrom || '').trim().slice(0, 120);
       }
+      const activeGmail = Boolean((db.settings as any).gmailUser && (db.settings as any).gmailAppPassword);
+      const activeResend = Boolean((db.settings as any).resendApiKey || getActiveResendKey());
       appendAudit(
         req.user!,
         'UPDATE_EMAIL_CONFIG',
         'settings',
         'email',
-        `Configuración de correo actualizada (Proveedor activo: ${Boolean((db.settings as any).resendApiKey || getActiveResendKey())})`
+        `Configuración de correo actualizada (Gmail SMTP: ${activeGmail ? (db.settings as any).gmailUser : 'No'}, Resend: ${activeResend ? 'Sí' : 'No'})`
       );
       await persistDb();
       res.json({
         ok: true,
-        emailProviderConfigured: Boolean((db.settings as any).resendApiKey || getActiveResendKey()),
+        gmailConfigured: activeGmail,
+        gmailUser: (db.settings as any).gmailUser || '',
+        resendConfigured: activeResend,
+        emailProviderConfigured: activeGmail || activeResend,
         emailFrom: (db.settings as any).emailFrom || process.env.EMAIL_FROM || 'LA VUELTA SESSIONS <onboarding@resend.dev>',
       });
     }

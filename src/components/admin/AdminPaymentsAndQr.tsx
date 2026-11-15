@@ -350,6 +350,8 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     }
   };
 
+  const [gmailUserInput, setGmailUserInput] = useState('forgen122@gmail.com');
+  const [gmailPassInput, setGmailPassInput] = useState('');
   const [resendKeyInput, setResendKeyInput] = useState('');
   const [emailFromInput, setEmailFromInput] = useState('');
   const [savingEmailConfig, setSavingEmailConfig] = useState(false);
@@ -359,13 +361,16 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     setSavingEmailConfig(true);
     try {
       await apiRequest('POST', '/api/admin/email-config', {
+        gmailUser: gmailUserInput.trim() || undefined,
+        gmailAppPassword: gmailPassInput.trim() || undefined,
         resendApiKey: resendKeyInput.trim() || undefined,
         emailFrom: emailFromInput.trim() || undefined,
       });
       onNotify(
-        'Configuración de envío de correo guardada en PostgreSQL. Ahora los QR se enviarán en vivo por SMTP.',
+        'Configuración de correo guardada en PostgreSQL. Ahora las entradas con código QR llegarán directo a la bandeja de entrada de Gmail.',
         'success'
       );
+      setGmailPassInput('');
       setResendKeyInput('');
       setShowEmailConfigBox(false);
       await onRefresh();
@@ -447,11 +452,12 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
 
       if (action === 'approve' && resp.emailDispatch) {
         setEmailTestResult(resp.emailDispatch);
+        setShowEmailPreviewModal(true);
       }
 
       onNotify(
         action === 'approve'
-          ? `Pago aprobado, entradas QR emitidas y pase enviado/simulado a ${resp.emailDispatch?.recipient || 'correo del comprador'}.`
+          ? `Pago aprobado, entradas QR emitidas y pase enviado/mostrado para ${resp.emailDispatch?.recipient || 'correo del comprador'}.`
           : 'Pago rechazado y registrado en auditoría.',
         action === 'approve' ? 'success' : 'info'
       );
@@ -528,7 +534,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
             Comprobantes Pendientes de Revisión
           </h1>
           <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            Revisa el comprobante privado antes de decidir. Los códigos QR se emiten únicamente tras aprobar el pago.
+            Revisa el comprobante privado antes de decidir. Al aprobar o enviar el pase, podrás visualizar inmediatamente la entrada QR enviada al comprador.
           </p>
         </div>
 
@@ -602,6 +608,16 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                     <span>Abrir Comprobante Privado</span>
                   </button>
 
+                  <button
+                    type="button"
+                    disabled={sendingTestEmail}
+                    onClick={() => handleSendTicketEmail(undefined, ord.id, ord.payerEmail || ord.userEmail)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3.5 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300"
+                  >
+                    <Mail className="h-4 w-4" />
+                    <span>Ver / Enviar Entrada QR</span>
+                  </button>
+
                   <input
                     type="text"
                     value={reviewNotesMap[ord.id] || ''}
@@ -619,7 +635,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                     className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-500 disabled:opacity-50 whitespace-nowrap"
                   >
                     <CheckCircle2 className="h-4 w-4" />
-                    <span>APROBAR PAGO</span>
+                    <span>APROBAR Y EMITIR QR</span>
                   </button>
 
                   <button
@@ -684,10 +700,61 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                     onClick={() => handleDecision(voucherModal.order.id, 'approve')}
                     className="rounded-lg bg-emerald-600 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-500"
                   >
-                    APROBAR PAGO
+                    APROBAR Y EMITIR QR
                   </button>
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* Modal Vista Previa del Correo con Entrada QR tras aprobar */}
+        {showEmailPreviewModal && emailTestResult && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
+            <div className="relative flex flex-col h-[90vh] w-full max-w-3xl rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950 overflow-hidden">
+              <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#E50914] text-white">
+                    <Mail className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
+                      Entrada Emitida y Correo Digital · {emailTestResult.ticketCode}
+                    </h3>
+                    <p className="text-[11px] text-zinc-500">
+                      Destinatario: <span className="font-medium text-zinc-800 dark:text-zinc-200">{emailTestResult.recipient}</span>
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={testingDoorValidation}
+                    onClick={() =>
+                      handleQuickDoorValidation(emailTestResult.qrPayload || emailTestResult.ticketCode)
+                    }
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    <ShieldCheck className="h-3.5 w-3.5" />
+                    <span>Validar Pase en Puerta</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowEmailPreviewModal(false)}
+                    className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 bg-zinc-900 p-2 overflow-hidden">
+                <iframe
+                  title="Ticket Email Preview"
+                  srcDoc={emailTestResult.emailHtml || ''}
+                  className="h-full w-full rounded-lg border-0 bg-zinc-950"
+                  sandbox="allow-same-origin"
+                />
+              </div>
             </div>
           </div>
         )}
@@ -776,28 +843,28 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                         >
                           Comprobante
                         </button>
+                        {o.status !== 'rejected' && o.status !== 'refunded' && (
+                          <button
+                            type="button"
+                            disabled={sendingTestEmail}
+                            onClick={() => handleSendTicketEmail(undefined, o.id, o.payerEmail || o.userEmail)}
+                            className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"
+                            title="Visualizar y enviar entrada QR por correo"
+                          >
+                            <Mail className="h-3 w-3" />
+                            <span>Ver / Enviar Pase</span>
+                          </button>
+                        )}
                         {o.status === 'approved' && (
-                          <>
-                            <button
-                              type="button"
-                              disabled={sendingTestEmail}
-                              onClick={() => handleSendTicketEmail(undefined, o.id, o.payerEmail || o.userEmail)}
-                              className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"
-                              title="Enviar o simular envío de entrada por correo"
-                            >
-                              <Mail className="h-3 w-3" />
-                              <span>Enviar Pase</span>
-                            </button>
-                            <button
-                              type="button"
-                              disabled={processingOrderId === o.id}
-                              onClick={() => handleRefund(o.id)}
-                              className="inline-flex items-center gap-1 text-xs font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white"
-                            >
-                              <RotateCcw className="h-3 w-3" />
-                              <span>Reembolsar</span>
-                            </button>
-                          </>
+                          <button
+                            type="button"
+                            disabled={processingOrderId === o.id}
+                            onClick={() => handleRefund(o.id)}
+                            className="inline-flex items-center gap-1 text-xs font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>Reembolsar</span>
+                          </button>
                         )}
                       </td>
                     </tr>
@@ -927,7 +994,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                 className="inline-flex items-center gap-1.5 rounded-full border border-zinc-300 bg-zinc-100 px-3 py-1 text-[11px] font-semibold text-zinc-700 hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
               >
                 <Mail className="h-3 w-3 text-[#E50914]" />
-                <span>{showEmailConfigBox ? 'Ocultar Config. Correo' : 'Configurar API Correo (Resend)'}</span>
+                <span>{showEmailConfigBox ? 'Ocultar Config. Correo' : 'Configurar Envío de Correo (Gmail / Resend)'}</span>
               </button>
               <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -937,41 +1004,83 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
           </div>
 
           {showEmailConfigBox && (
-            <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 dark:bg-amber-500/10">
-              <p className="text-xs font-bold text-zinc-900 dark:text-white">
-                Activar Envío de Correos en Vivo a Compradores (Resend API)
-              </p>
-              <p className="mt-1 text-[11px] text-zinc-600 dark:text-zinc-300">
-                Al aprobar un pago o usar el simulador, el servidor genera todos los códigos QR firmados y los envía con imágenes PNG adjuntas al correo del comprador. Pega aquí tu clave <code className="font-mono">re_...</code> de Resend.com para activar el despacho real:
-              </p>
-              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-12">
+            <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 space-y-3 dark:bg-amber-500/10">
+              <div>
+                <p className="text-xs font-bold text-zinc-900 dark:text-white">
+                  Activar Envío de Entradas QR a la Bandeja de Gmail de Cualquier Comprador
+                </p>
+                <p className="mt-1 text-[11px] text-zinc-600 dark:text-zinc-300">
+                  <strong>Opción 1 (Recomendada - Gmail Directo):</strong> Ingresa tu correo Gmail y una{' '}
+                  <a
+                    href="https://myaccount.google.com/apppasswords"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-semibold text-[#E50914] underline"
+                  >
+                    Contraseña de Aplicación de Google (16 letras)
+                  </a>
+                  . Así las entradas llegarán al instante al Gmail de cualquier comprador sin restricciones de dominio.
+                </p>
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
                 <div className="sm:col-span-5">
+                  <label className="mb-1 block text-[11px] font-semibold text-zinc-700 dark:text-zinc-300">
+                    Tu Correo Gmail Remitente
+                  </label>
                   <input
-                    type="password"
-                    value={resendKeyInput}
-                    onChange={(e) => setResendKeyInput(e.target.value)}
-                    placeholder="RESEND_API_KEY (ej. re_123456789...)"
+                    type="email"
+                    value={gmailUserInput}
+                    onChange={(e) => setGmailUserInput(e.target.value)}
+                    placeholder="forgen122@gmail.com"
                     className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
                   />
                 </div>
                 <div className="sm:col-span-4">
+                  <label className="mb-1 block text-[11px] font-semibold text-zinc-700 dark:text-zinc-300">
+                    Contraseña de Aplicación Google (16 letras)
+                  </label>
                   <input
-                    type="text"
-                    value={emailFromInput}
-                    onChange={(e) => setEmailFromInput(e.target.value)}
-                    placeholder="Remitente (opcional, ej. LA VUELTA <onboarding@resend.dev>)"
+                    type="password"
+                    value={gmailPassInput}
+                    onChange={(e) => setGmailPassInput(e.target.value)}
+                    placeholder="xxxx xxxx xxxx xxxx"
                     className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
                   />
                 </div>
-                <div className="sm:col-span-3">
+                <div className="flex items-end sm:col-span-3">
                   <button
                     type="button"
                     disabled={savingEmailConfig}
                     onClick={handleSaveEmailConfig}
-                    className="w-full rounded-lg bg-zinc-900 px-3 py-2 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-900"
+                    className="w-full rounded-lg bg-[#E50914] px-3 py-2 text-xs font-semibold text-white hover:bg-[#c80812]"
                   >
-                    {savingEmailConfig ? 'Guardando...' : 'Guardar Conector'}
+                    {savingEmailConfig ? 'Guardando...' : 'Guardar Correo'}
                   </button>
+                </div>
+              </div>
+              <div className="border-t border-zinc-200/70 pt-2.5 dark:border-zinc-800">
+                <p className="text-[11px] text-zinc-500 mb-2">
+                  <strong>Opción 2 (Alternativa - Resend API):</strong> Si usas Resend.com, pega tu API Key <code className="font-mono">re_...</code>:
+                </p>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
+                  <div className="sm:col-span-6">
+                    <input
+                      type="password"
+                      value={resendKeyInput}
+                      onChange={(e) => setResendKeyInput(e.target.value)}
+                      placeholder="RESEND_API_KEY (ej. re_123456789...)"
+                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                    />
+                  </div>
+                  <div className="sm:col-span-6">
+                    <input
+                      type="text"
+                      value={emailFromInput}
+                      onChange={(e) => setEmailFromInput(e.target.value)}
+                      placeholder="Remitente Resend (opcional, ej. LA VUELTA <onboarding@resend.dev>)"
+                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                    />
+                  </div>
                 </div>
               </div>
             </div>

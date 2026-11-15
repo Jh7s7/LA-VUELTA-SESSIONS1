@@ -266,6 +266,12 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
     orderId: string;
     qty: number;
     email: string;
+    emailDispatch?: {
+      recipient: string;
+      ticketCode: string;
+      emailHtml: string;
+      sentRealSmtp?: boolean;
+    };
   } | null>(null);
   const [sendingWalletTicketId, setSendingWalletTicketId] = useState<string | null>(null);
   const [walletEmailPreview, setWalletEmailPreview] = useState<{
@@ -685,14 +691,32 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
       });
 
       const orderResult = resp?.order;
+      const dispatch = resp?.emailDispatch;
+      const emailPreviewObj =
+        dispatch && dispatch.emailHtml
+          ? {
+              recipient: dispatch.recipient || cleanPayerEmail || currentUser.email,
+              ticketCode: dispatch.ticketCode || orderResult?.id || 'PASE-QR',
+              emailHtml: dispatch.emailHtml,
+              sentRealSmtp: dispatch.sentRealSmtp,
+            }
+          : undefined;
+
       setOrderSuccessBanner({
         orderId: orderResult?.id || 'ORD-EXITOSA',
         qty: generalQty + vipQty,
         email: cleanPayerEmail || currentUser.email,
+        emailDispatch: emailPreviewObj,
       });
 
+      if (emailPreviewObj) {
+        setWalletEmailPreview(emailPreviewObj);
+      }
+
       onNotify(
-        `¡Pago registrado exitosamente! Miles de gracias. En un lapso de 48 a 72 horas se estará verificando tu pago y te llegará la entrada con código QR a tu correo (${cleanPayerEmail || currentUser.email}).`,
+        dispatch?.sentRealSmtp
+          ? `¡Compra registrada y entrada QR enviada a tu correo (${cleanPayerEmail || currentUser.email})!`
+          : `¡Compra registrada! Aquí tienes tu entrada oficial con código QR lista para visualizar y escanear.`,
         'success'
       );
       await onRefreshBootstrap();
@@ -3027,16 +3051,26 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
 
             {orderSuccessBanner && (
               <div className="rounded-2xl border border-emerald-500/40 bg-emerald-500/[0.08] p-5 text-xs text-zinc-900 dark:text-zinc-100">
-                <div className="flex items-start justify-between gap-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="flex items-start gap-3">
                     <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
                     <div>
                       <p className="text-sm font-bold text-emerald-700 dark:text-emerald-400">
-                        ¡Comprobante recibido con éxito! (Orden {orderSuccessBanner.orderId})
+                        ¡Entrada QR Generada con Éxito! (Orden {orderSuccessBanner.orderId})
                       </p>
                       <p className="mt-1 text-xs text-zinc-700 dark:text-zinc-300">
-                        Se registraron {orderSuccessBanner.qty} entrada(s). En un lapso de 48 a 72 horas se estará validando el comprobante bancario y recibirás tus pases QR en <strong>{orderSuccessBanner.email}</strong>.
+                        Se emitieron {orderSuccessBanner.qty} entrada(s) asociadas a <strong>{orderSuccessBanner.email}</strong>. Ya puedes visualizar tu correo de entrada con código QR aquí mismo o en tu billetera digital.
                       </p>
+                      {orderSuccessBanner.emailDispatch && (
+                        <button
+                          type="button"
+                          onClick={() => setWalletEmailPreview(orderSuccessBanner.emailDispatch!)}
+                          className="mt-3 inline-flex items-center gap-1.5 rounded-xl bg-[#E50914] px-4 py-2 text-xs font-bold text-white shadow-xs hover:bg-[#c80812]"
+                        >
+                          <Ticket className="h-3.5 w-3.5" />
+                          <span>Visualizar Correo con mi Entrada QR</span>
+                        </button>
+                      )}
                     </div>
                   </div>
                   <button
@@ -3192,8 +3226,8 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
                             >
                               <span>
                                 {sendingWalletTicketId === t.id
-                                  ? 'Enviando...'
-                                  : 'Enviar a mi Correo'}
+                                  ? 'Abriendo correo...'
+                                  : 'Ver / Enviar a mi Correo'}
                               </span>
                             </button>
                           </div>
