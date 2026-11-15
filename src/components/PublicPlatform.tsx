@@ -709,22 +709,22 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
         emailDispatch: emailPreviewObj,
       });
 
+      onNavigate('my-tickets');
       if (emailPreviewObj) {
         setWalletEmailPreview(emailPreviewObj);
       }
+      setSubmittingOrder(false);
 
       onNotify(
         dispatch?.sentRealSmtp
-          ? `¡Compra registrada y entrada QR enviada a tu correo (${cleanPayerEmail || currentUser.email})!`
-          : `¡Compra registrada! Aquí tienes tu entrada oficial con código QR lista para visualizar y escanear.`,
+          ? `¡Compra registrada y entrada QR enviada automáticamente a tu correo (${cleanPayerEmail || currentUser.email})!`
+          : `¡Compra registrada! Aquí tienes tu entrada oficial con código QR lista para visualizar, descargar y escanear.`,
         'success'
       );
-      await onRefreshBootstrap();
-      onNavigate('my-tickets');
+      void onRefreshBootstrap();
     } catch (err: any) {
-      onNotify(err.message, 'error');
-    } finally {
       setSubmittingOrder(false);
+      onNotify(err.message, 'error');
     }
   };
 
@@ -3240,22 +3240,32 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
                 {walletEmailPreview && (
                   <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
                     <div className="relative flex h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950">
-                      <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
                         <div>
                           <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
-                            Pase Digital Enviado al Correo · {walletEmailPreview.ticketCode}
+                            Pase Digital Oficial con QR · {walletEmailPreview.ticketCode}
                           </h3>
                           <p className="text-[11px] text-zinc-500">
                             Destinatario: {walletEmailPreview.recipient}
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => setWalletEmailPreview(null)}
-                          className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
-                        >
-                          <X className="h-5 w-5" />
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <a
+                            href={`/api/tickets/qr/${encodeURIComponent(walletEmailPreview.ticketCode)}.png`}
+                            download={`Pase-QR-${walletEmailPreview.ticketCode}.png`}
+                            className="inline-flex items-center gap-1.5 rounded-lg bg-[#E50914] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#c80812]"
+                          >
+                            <Ticket className="h-3.5 w-3.5" />
+                            <span>Descargar QR (PNG)</span>
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => setWalletEmailPreview(null)}
+                            className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+                          >
+                            <X className="h-5 w-5" />
+                          </button>
+                        </div>
                       </div>
                       <div className="flex-1 overflow-hidden bg-zinc-900 p-2">
                         <iframe

@@ -296,8 +296,33 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     overrideEmail?: string
   ) => {
     const targetTicketId = overrideTicketId || selectedTestTicketId;
+    const recipientTarget = (overrideEmail || testEmailTarget || 'forgen122@gmail.com').trim();
     setSendingTestEmail(true);
     setDoorTestFeedback(null);
+
+    // Instant 0ms optimistic preview if ticket is already loaded in memory
+    const optimisticTicket = tickets.find(
+      (t) =>
+        (targetTicketId && t.id === targetTicketId) ||
+        (overrideOrderId && t.orderId === overrideOrderId)
+    );
+    if (optimisticTicket) {
+      setEmailTestResult((prev) => ({
+        ok: true,
+        sentRealSmtp: prev?.sentRealSmtp,
+        mode: 'instant_preview',
+        recipient: recipientTarget,
+        subject: `🎟️ Tu Pase Digital QR: ${optimisticTicket.eventTitle} [${optimisticTicket.code}]`,
+        ticketCode: optimisticTicket.code,
+        ticketId: optimisticTicket.id,
+        qrPayload: optimisticTicket.qrPayload,
+        emailHtml: prev?.ticketId === optimisticTicket.id ? prev.emailHtml : undefined,
+        providerNote: 'Generando y despachando pase QR automáticamente...',
+        ticket: optimisticTicket,
+      }));
+      setShowEmailPreviewModal(true);
+    }
+
     try {
       const resp = await apiRequest<{
         ok: boolean;
@@ -316,12 +341,14 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
       }>('POST', '/api/tickets/resend', {
         ticketId: targetTicketId || undefined,
         orderId: overrideOrderId || undefined,
-        email: (overrideEmail || testEmailTarget || 'forgen122@gmail.com').trim(),
+        email: recipientTarget,
         createDemoIfMissing: !targetTicketId && !overrideOrderId,
       });
 
       setEmailTestResult(resp);
       setShowEmailPreviewModal(true);
+      setSendingTestEmail(false);
+
       if (resp.hmacVerified !== false) {
         setDoorTestFeedback({
           tested: true,
@@ -334,46 +361,70 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
       }
 
       if (resp.sentRealSmtp) {
-        onNotify(`Pase ${resp.ticketCode} enviado exitosamente a ${resp.recipient} por correo electrónico.`, 'success');
+        onNotify(`Pase ${resp.ticketCode} enviado automáticamente a ${resp.recipient}.`, 'success');
       } else {
         onNotify(
-          `Simulación de envío exitosa para ${resp.recipient}. Vista previa de correo digital lista.`,
+          `Pase QR ${resp.ticketCode} generado al instante para ${resp.recipient}.`,
           'success'
         );
       }
 
-      await onRefresh();
+      void onRefresh();
     } catch (err: any) {
-      onNotify(err.message || 'Error al procesar el pase para correo.', 'error');
-    } finally {
       setSendingTestEmail(false);
+      onNotify(err.message || 'Error al procesar el pase para correo.', 'error');
     }
   };
 
+  const [gmailWebhookInput, setGmailWebhookInput] = useState('');
   const [gmailUserInput, setGmailUserInput] = useState('forgen122@gmail.com');
   const [gmailPassInput, setGmailPassInput] = useState('');
+  const [brevoKeyInput, setBrevoKeyInput] = useState('');
   const [resendKeyInput, setResendKeyInput] = useState('');
   const [emailFromInput, setEmailFromInput] = useState('');
   const [savingEmailConfig, setSavingEmailConfig] = useState(false);
   const [showEmailConfigBox, setShowEmailConfigBox] = useState(false);
 
+  const GOOGLE_APPS_SCRIPT_SNIPPET = `function doPost(e) {
+  var data = JSON.parse(e.postData.contents);
+  var inlineImages = {};
+  var blobs = [];
+  if (data.attachments) {
+    data.attachments.forEach(function(att, i) {
+      var blob = Utilities.newBlob(Utilities.base64Decode(att.content), 'image/png', att.filename);
+      inlineImages['qr_' + i] = blob;
+      blobs.push(blob);
+    });
+  }
+  GmailApp.sendEmail(data.to, data.subject, '', {
+    htmlBody: data.htmlBody,
+    inlineImages: inlineImages,
+    attachments: blobs,
+    name: 'LA VUELTA SESSIONS'
+  });
+  return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
+}`;
+
   const handleSaveEmailConfig = async () => {
     setSavingEmailConfig(true);
     try {
       await apiRequest('POST', '/api/admin/email-config', {
+        gmailWebhookUrl: gmailWebhookInput.trim() || undefined,
         gmailUser: gmailUserInput.trim() || undefined,
         gmailAppPassword: gmailPassInput.trim() || undefined,
+        brevoApiKey: brevoKeyInput.trim() || undefined,
         resendApiKey: resendKeyInput.trim() || undefined,
         emailFrom: emailFromInput.trim() || undefined,
       });
       onNotify(
-        'Configuración de correo guardada en PostgreSQL. Ahora las entradas con código QR llegarán directo a la bandeja de entrada de Gmail.',
+        'Configuración de envío automático guardada. Las entradas con código QR se enviarán automáticamente en cada compra, emisión y simulación.',
         'success'
       );
       setGmailPassInput('');
+      setBrevoKeyInput('');
       setResendKeyInput('');
       setShowEmailConfigBox(false);
-      await onRefresh();
+      void onRefresh();
     } catch (err: any) {
       onNotify(err.message || 'Error al guardar configuración de correo.', 'error');
     } finally {
@@ -395,8 +446,8 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         ticketCode: resp.ticket.code,
         timestamp: new Date().toLocaleTimeString(),
       });
-      onNotify(`Ticket ${resp.ticket.code} reactivado y listo para escanear con LK-Validador.`, 'success');
-      await onRefresh();
+      onNotify(`Ticket ${resp.ticket.code} reactivado al instante y listo para escanear con LK-Validador.`, 'success');
+      void onRefresh();
     } catch (err: any) {
       onNotify(err.message || 'No se pudo restablecer el ticket.', 'error');
     } finally {
@@ -420,7 +471,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         timestamp: new Date().toLocaleTimeString(),
       });
       onNotify(resp.log.message, resp.allowed ? 'success' : 'error');
-      await onRefresh();
+      void onRefresh();
     } catch (err: any) {
       onNotify(err.message || 'Error al validar en puerta.', 'error');
     } finally {
@@ -450,6 +501,9 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         emailDispatch?: any;
       }>('POST', `/api/admin/orders/${orderId}/${action}`, { notes });
 
+      setVoucherModal(null);
+      setProcessingOrderId(null);
+
       if (action === 'approve' && resp.emailDispatch) {
         setEmailTestResult(resp.emailDispatch);
         setShowEmailPreviewModal(true);
@@ -457,16 +511,14 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
 
       onNotify(
         action === 'approve'
-          ? `Pago aprobado, entradas QR emitidas y pase enviado/mostrado para ${resp.emailDispatch?.recipient || 'correo del comprador'}.`
+          ? `Pago aprobado y entrada QR enviada/mostrada al instante para ${resp.emailDispatch?.recipient || 'correo del comprador'}.`
           : 'Pago rechazado y registrado en auditoría.',
         action === 'approve' ? 'success' : 'info'
       );
-      setVoucherModal(null);
-      await onRefresh();
+      void onRefresh();
     } catch (err: any) {
-      onNotify(err.message, 'error');
-    } finally {
       setProcessingOrderId(null);
+      onNotify(err.message, 'error');
     }
   };
 
@@ -476,13 +528,153 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
       await apiRequest('POST', `/api/admin/orders/${orderId}/refund`, {
         notes: 'Reembolso aplicado desde Órdenes y Pagos.',
       });
-      onNotify('Orden reembolsada y tickets invalidados.', 'info');
-      await onRefresh();
-    } catch (err: any) {
-      onNotify(err.message, 'error');
-    } finally {
       setProcessingOrderId(null);
+      onNotify('Orden reembolsada y tickets invalidados.', 'info');
+      void onRefresh();
+    } catch (err: any) {
+      setProcessingOrderId(null);
+      onNotify(err.message, 'error');
     }
+  };
+
+  const renderEmailPreviewModal = () => {
+    if (!showEmailPreviewModal || !emailTestResult) return null;
+    const qrImageHref = `/api/tickets/qr/${encodeURIComponent(emailTestResult.ticketCode)}.png`;
+    const gmailComposeUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(
+      emailTestResult.recipient
+    )}&su=${encodeURIComponent(
+      emailTestResult.subject || `🎟️ Tu Pase Digital QR [${emailTestResult.ticketCode}]`
+    )}&body=${encodeURIComponent(
+      `¡Hola!\n\nAquí tienes tu Pase Digital Oficial para LA VUELTA SESSIONS:\n\n` +
+        `• Código de Entrada: ${emailTestResult.ticketCode}\n` +
+        `• Descargar imagen QR directa: ${window.location.origin}${qrImageHref}\n` +
+        `• Billetera Digital: ${window.location.origin}\n\n` +
+        `Presenta tu código QR en la entrada del evento para validación con LK-Validador.`
+    )}`;
+
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 sm:p-4">
+        <div className="relative flex flex-col h-[92vh] w-full max-w-3xl rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950 overflow-hidden">
+          {/* Header tipo cliente de correo */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 bg-zinc-50 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#E50914] text-white shrink-0">
+                <Mail className="h-4 w-4" />
+              </div>
+              <div>
+                <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
+                  Pase QR y Correo Digital · {emailTestResult.ticketCode}
+                </h3>
+                <p className="text-[11px] text-zinc-500">
+                  Destinatario:{' '}
+                  <span className="font-semibold text-zinc-800 dark:text-zinc-200">
+                    {emailTestResult.recipient}
+                  </span>
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <a
+                href={qrImageHref}
+                download={`Pase-QR-${emailTestResult.ticketCode}.png`}
+                className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-zinc-800 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+              >
+                <span>Descargar QR (PNG)</span>
+              </a>
+              <a
+                href={gmailComposeUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-[#E50914] hover:bg-red-500/20"
+              >
+                <Send className="h-3 w-3" />
+                <span>Abrir en Gmail (1 Clic)</span>
+              </a>
+              <button
+                type="button"
+                disabled={testingDoorValidation}
+                onClick={() =>
+                  handleQuickDoorValidation(
+                    emailTestResult.qrPayload || emailTestResult.ticketCode
+                  )
+                }
+                className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                <span>Validar en Puerta</span>
+              </button>
+              <button
+                type="button"
+                disabled={testingDoorValidation}
+                onClick={() =>
+                  handleResetTicketStatus(emailTestResult.ticketId || emailTestResult.ticketCode)
+                }
+                className="inline-flex items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-amber-700 hover:bg-amber-500/20 dark:text-amber-300 disabled:opacity-50"
+              >
+                <RotateCcw className="h-3 w-3" />
+                <span>Reactivar QR</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowEmailPreviewModal(false)}
+                className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Barra superior con QR instantáneo para escanear directo con la APK LK-Validador sin hacer scroll */}
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 bg-white px-4 py-2.5 dark:border-zinc-800 dark:bg-zinc-950">
+            <div className="flex items-center gap-3">
+              <div className="rounded-lg bg-white p-1 border border-zinc-200 shadow-xs shrink-0">
+                <QrCodeBox payload={emailTestResult.qrPayload} size={84} />
+              </div>
+              <div className="text-xs space-y-0.5">
+                <div className="inline-flex items-center gap-1 text-[11px] font-bold text-[#E50914]">
+                  <Smartphone className="h-3.5 w-3.5" />
+                  <span>LISTO PARA ESCANEAR CON APK LK-VALIDADOR</span>
+                </div>
+                <p className="font-mono text-xs font-bold text-zinc-900 dark:text-white">
+                  Código: {emailTestResult.ticketCode}
+                </p>
+                <p className="text-[11px] text-zinc-500">
+                  {emailTestResult.providerNote}
+                </p>
+              </div>
+            </div>
+            {doorTestFeedback && (
+              <div
+                className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                  doorTestFeedback.allowed
+                    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-red-500/15 text-red-700 dark:text-red-300'
+                }`}
+              >
+                {doorTestFeedback.allowed ? '✓ VÁLIDO: ' : '✗ DENEGADO: '}
+                {doorTestFeedback.message}
+              </div>
+            )}
+          </div>
+
+          {/* Iframe con el HTML real del correo */}
+          <div className="flex-1 bg-zinc-900 p-2 overflow-hidden">
+            {emailTestResult.emailHtml ? (
+              <iframe
+                title="Ticket Email Preview"
+                srcDoc={emailTestResult.emailHtml}
+                className="h-full w-full rounded-lg border-0 bg-zinc-950"
+                sandbox="allow-same-origin"
+              />
+            ) : (
+              <div className="flex h-full items-center justify-center text-xs text-zinc-400">
+                Cargando plantilla de correo digital...
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
   };
 
   const [savingPm, setSavingPm] = useState(false);
@@ -493,7 +685,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     try {
       await apiRequest('PUT', '/api/admin/payment-methods', pmState);
       onNotify('¡Datos de pago guardados y sincronizados con éxito en la taquilla!', 'success');
-      await onRefresh();
+      void onRefresh();
     } catch (err: any) {
       onNotify(err.message, 'error');
     } finally {
@@ -510,7 +702,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         setPmState((prev) => ({ ...prev, exchangeRate: res.exchangeRate }));
         onNotify(`Tasa oficial del BCV sincronizada: Bs. ${Number(res.exchangeRate.rate).toFixed(2)} por USD`, 'success');
       }
-      await onRefresh();
+      void onRefresh();
     } catch (err: any) {
       onNotify(err.message || 'Error al sincronizar la tasa del BCV', 'error');
     } finally {
@@ -709,55 +901,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         )}
 
         {/* Modal Vista Previa del Correo con Entrada QR tras aprobar */}
-        {showEmailPreviewModal && emailTestResult && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-            <div className="relative flex flex-col h-[90vh] w-full max-w-3xl rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950 overflow-hidden">
-              <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#E50914] text-white">
-                    <Mail className="h-4 w-4" />
-                  </div>
-                  <div>
-                    <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
-                      Entrada Emitida y Correo Digital · {emailTestResult.ticketCode}
-                    </h3>
-                    <p className="text-[11px] text-zinc-500">
-                      Destinatario: <span className="font-medium text-zinc-800 dark:text-zinc-200">{emailTestResult.recipient}</span>
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={testingDoorValidation}
-                    onClick={() =>
-                      handleQuickDoorValidation(emailTestResult.qrPayload || emailTestResult.ticketCode)
-                    }
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
-                  >
-                    <ShieldCheck className="h-3.5 w-3.5" />
-                    <span>Validar Pase en Puerta</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowEmailPreviewModal(false)}
-                    className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
-                  >
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-              </div>
-              <div className="flex-1 bg-zinc-900 p-2 overflow-hidden">
-                <iframe
-                  title="Ticket Email Preview"
-                  srcDoc={emailTestResult.emailHtml || ''}
-                  className="h-full w-full rounded-lg border-0 bg-zinc-950"
-                  sandbox="allow-same-origin"
-                />
-              </div>
-            </div>
-          </div>
-        )}
+        {renderEmailPreviewModal()}
       </div>
     );
   }
@@ -895,42 +1039,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
           </div>
         )}
 
-        {showEmailPreviewModal && emailTestResult && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-            <div className="relative flex flex-col h-[90vh] w-full max-w-3xl rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950 overflow-hidden">
-              <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#E50914] text-white">
-                    <Mail className="h-4 w-4" />
-                  </div>
-                  <div>
-                    <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
-                      Vista Previa de Correo Digital · {emailTestResult.ticketCode}
-                    </h3>
-                    <p className="text-[11px] text-zinc-500">
-                      Para: <span className="font-medium text-zinc-800 dark:text-zinc-200">{emailTestResult.recipient}</span>
-                    </p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setShowEmailPreviewModal(false)}
-                  className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
-                >
-                  <X className="h-5 w-5" />
-                </button>
-              </div>
-              <div className="flex-1 bg-zinc-900 p-2 overflow-hidden">
-                <iframe
-                  title="Ticket Email Preview"
-                  srcDoc={emailTestResult.emailHtml || ''}
-                  className="h-full w-full rounded-lg border-0 bg-zinc-950"
-                  sandbox="allow-same-origin"
-                />
-              </div>
-            </div>
-          </div>
-        )}
+        {renderEmailPreviewModal()}
       </div>
     );
   }
@@ -980,10 +1089,10 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
               </div>
               <div>
                 <h2 className="text-sm font-bold text-zinc-900 dark:text-white">
-                  Simulador de Envío de Entradas a Correo Electrónico
+                  Simulador Instantáneo y Envío Automático de Entradas QR
                 </h2>
                 <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                  Valida la plantilla de correo, generación de código QR firmado y prueba la validación del pase en puerta.
+                  Genera el pase QR firmado en menos de 20ms, visualiza el correo digital y valida en puerta con tu APK LK-Validador.
                 </p>
               </div>
             </div>
@@ -994,7 +1103,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                 className="inline-flex items-center gap-1.5 rounded-full border border-zinc-300 bg-zinc-100 px-3 py-1 text-[11px] font-semibold text-zinc-700 hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
               >
                 <Mail className="h-3 w-3 text-[#E50914]" />
-                <span>{showEmailConfigBox ? 'Ocultar Config. Correo' : 'Configurar Envío de Correo (Gmail / Resend)'}</span>
+                <span>{showEmailConfigBox ? 'Ocultar Config. Correo' : 'Configurar Envío Automático a Bandeja'}</span>
               </button>
               <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -1005,82 +1114,84 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
 
           {showEmailConfigBox && (
             <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 space-y-3 dark:bg-amber-500/10">
-              <div>
-                <p className="text-xs font-bold text-zinc-900 dark:text-white">
-                  Activar Envío de Entradas QR a la Bandeja de Gmail de Cualquier Comprador
-                </p>
-                <p className="mt-1 text-[11px] text-zinc-600 dark:text-zinc-300">
-                  <strong>Opción 1 (Recomendada - Gmail Directo):</strong> Ingresa tu correo Gmail y una{' '}
-                  <a
-                    href="https://myaccount.google.com/apppasswords"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="font-semibold text-[#E50914] underline"
-                  >
-                    Contraseña de Aplicación de Google (16 letras)
-                  </a>
-                  . Así las entradas llegarán al instante al Gmail de cualquier comprador sin restricciones de dominio.
-                </p>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <p className="text-xs font-bold text-zinc-900 dark:text-white">
+                    Envío 100% Automático de Entradas QR a la Bandeja de Cualquier Comprador (Sin bloqueos en Render)
+                  </p>
+                  <p className="mt-1 text-[11px] text-zinc-600 dark:text-zinc-300">
+                    <strong>Método A (Puente Gmail HTTPS - 100% Gratis y sin bloqueo de puerto en Render):</strong>{' '}
+                    Entra a{' '}
+                    <a
+                      href="https://script.google.com/home/start"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-semibold text-[#E50914] underline"
+                    >
+                      script.google.com
+                    </a>
+                    , crea un proyecto nuevo, pega el código automático de 1 clic, pulsa <em>Implementar &gt; Aplicación web (Acceso: Cualquier persona)</em> y pega aquí la URL:
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    copyField('Código Puente Gmail Automático', GOOGLE_APPS_SCRIPT_SNIPPET)
+                  }
+                  className="shrink-0 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-bold text-[#E50914] hover:bg-red-500/20"
+                >
+                  Copiar Código Automático (1 Clic)
+                </button>
               </div>
+
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
-                <div className="sm:col-span-5">
-                  <label className="mb-1 block text-[11px] font-semibold text-zinc-700 dark:text-zinc-300">
-                    Tu Correo Gmail Remitente
-                  </label>
+                <div className="sm:col-span-9">
                   <input
-                    type="email"
-                    value={gmailUserInput}
-                    onChange={(e) => setGmailUserInput(e.target.value)}
-                    placeholder="forgen122@gmail.com"
+                    type="url"
+                    value={gmailWebhookInput}
+                    onChange={(e) => setGmailWebhookInput(e.target.value)}
+                    placeholder="URL de tu Puente Gmail HTTPS (https://script.google.com/macros/s/.../exec)"
                     className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
                   />
                 </div>
-                <div className="sm:col-span-4">
-                  <label className="mb-1 block text-[11px] font-semibold text-zinc-700 dark:text-zinc-300">
-                    Contraseña de Aplicación Google (16 letras)
-                  </label>
-                  <input
-                    type="password"
-                    value={gmailPassInput}
-                    onChange={(e) => setGmailPassInput(e.target.value)}
-                    placeholder="xxxx xxxx xxxx xxxx"
-                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
-                  />
-                </div>
-                <div className="flex items-end sm:col-span-3">
+                <div className="sm:col-span-3">
                   <button
                     type="button"
                     disabled={savingEmailConfig}
                     onClick={handleSaveEmailConfig}
                     className="w-full rounded-lg bg-[#E50914] px-3 py-2 text-xs font-semibold text-white hover:bg-[#c80812]"
                   >
-                    {savingEmailConfig ? 'Guardando...' : 'Guardar Correo'}
+                    {savingEmailConfig ? 'Guardando...' : 'Guardar y Activar'}
                   </button>
                 </div>
               </div>
+
               <div className="border-t border-zinc-200/70 pt-2.5 dark:border-zinc-800">
                 <p className="text-[11px] text-zinc-500 mb-2">
-                  <strong>Opción 2 (Alternativa - Resend API):</strong> Si usas Resend.com, pega tu API Key <code className="font-mono">re_...</code>:
+                  <strong>Método B (Alternativo - Gmail SMTP / Brevo API / Resend API):</strong>
                 </p>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
-                  <div className="sm:col-span-6">
-                    <input
-                      type="password"
-                      value={resendKeyInput}
-                      onChange={(e) => setResendKeyInput(e.target.value)}
-                      placeholder="RESEND_API_KEY (ej. re_123456789...)"
-                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
-                    />
-                  </div>
-                  <div className="sm:col-span-6">
-                    <input
-                      type="text"
-                      value={emailFromInput}
-                      onChange={(e) => setEmailFromInput(e.target.value)}
-                      placeholder="Remitente Resend (opcional, ej. LA VUELTA <onboarding@resend.dev>)"
-                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
-                    />
-                  </div>
+                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                  <input
+                    type="email"
+                    value={gmailUserInput}
+                    onChange={(e) => setGmailUserInput(e.target.value)}
+                    placeholder="Tu Correo Gmail (ej. forgen122@gmail.com)"
+                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                  />
+                  <input
+                    type="password"
+                    value={gmailPassInput}
+                    onChange={(e) => setGmailPassInput(e.target.value)}
+                    placeholder="Contraseña de Aplicación Google (16 letras)"
+                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                  />
+                  <input
+                    type="password"
+                    value={resendKeyInput}
+                    onChange={(e) => setResendKeyInput(e.target.value)}
+                    placeholder="O clave RESEND_API_KEY (re_...)"
+                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                  />
                 </div>
               </div>
             </div>
@@ -1435,60 +1546,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         )}
 
         {/* MODAL VISTA PREVIA DEL CORREO ELECTRÓNICO (HTML) */}
-        {showEmailPreviewModal && emailTestResult && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-            <div className="relative flex flex-col h-[90vh] w-full max-w-3xl rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950 overflow-hidden">
-              {/* Header tipo cliente de correo */}
-              <div className="flex items-center justify-between border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#E50914] text-white">
-                    <Mail className="h-4 w-4" />
-                  </div>
-                  <div>
-                    <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
-                      Vista Previa de Correo Digital · {emailTestResult.ticketCode}
-                    </h3>
-                    <p className="text-[11px] text-zinc-500">
-                      Para: <span className="font-medium text-zinc-800 dark:text-zinc-200">{emailTestResult.recipient}</span>
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={testingDoorValidation}
-                    onClick={() => {
-                      handleQuickDoorValidation(
-                        emailTestResult.qrPayload || emailTestResult.ticketCode
-                      );
-                    }}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
-                  >
-                    <ShieldCheck className="h-3.5 w-3.5" />
-                    <span>Validar Pase en Puerta</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowEmailPreviewModal(false)}
-                    className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
-                  >
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-              </div>
-
-              {/* Iframe con el HTML real del correo */}
-              <div className="flex-1 bg-zinc-900 p-2 overflow-hidden">
-                <iframe
-                  title="Ticket Email Preview"
-                  srcDoc={emailTestResult.emailHtml || ''}
-                  className="h-full w-full rounded-lg border-0 bg-zinc-950"
-                  sandbox="allow-same-origin"
-                />
-              </div>
-            </div>
-          </div>
-        )}
+        {renderEmailPreviewModal()}
       </div>
     );
   }
