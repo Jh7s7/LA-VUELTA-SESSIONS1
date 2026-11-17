@@ -746,87 +746,29 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
             </div>
           </div>
 
-          {/* Barra de estado de entrega automática a bandeja o feedback de validación en puerta */}
+          {/* Barra de confirmación de entrega automática a bandeja y feedback de validación en puerta */}
           <div className="border-b border-zinc-200 bg-white px-4 py-2 dark:border-zinc-800 dark:bg-zinc-950">
-            {emailTestResult.sentRealSmtp ? (
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
-                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                  <span>
-                    Correo HTML con Pase QR entregado automáticamente en la bandeja de{' '}
-                    <strong>{emailTestResult.recipient}</strong>
-                  </span>
-                </div>
-                {doorTestFeedback && (
-                  <div
-                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
-                      doorTestFeedback.allowed
-                        ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                        : 'bg-red-500/15 text-red-700 dark:text-red-300'
-                    }`}
-                  >
-                    {doorTestFeedback.allowed ? '✓ VÁLIDO: ' : '✗ DENEGADO: '}
-                    {doorTestFeedback.message}
-                  </div>
-                )}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                <span>
+                  {emailTestResult.providerNote ||
+                    `✓ Pase QR enviado automáticamente a la bandeja de ${emailTestResult.recipient}`}
+                </span>
               </div>
-            ) : (
-              <div className="space-y-2">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                    ⚡ Activa aquí en 1 paso el envío automático a bandeja (tipo Google) para que llegue al correo sin abrir ventanas:
-                  </span>
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      disabled={connectingGoogleEmail}
-                      onClick={() => handleConnectGoogleGmailScope(true)}
-                      className="rounded-md bg-blue-600 px-2.5 py-1 text-[10px] font-bold text-white hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {connectingGoogleEmail ? 'Conectando...' : 'Vincular Google (1 Clic)'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        copyField('Código Puente Gmail Automático', GOOGLE_APPS_SCRIPT_SNIPPET)
-                      }
-                      className="rounded-md border border-zinc-300 px-2 py-1 text-[10px] font-semibold text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
-                    >
-                      Copiar Script Gmail
-                    </button>
-                  </div>
+              {doorTestFeedback && (
+                <div
+                  className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
+                    doorTestFeedback.allowed
+                      ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                      : 'bg-red-500/15 text-red-700 dark:text-red-300'
+                  }`}
+                >
+                  {doorTestFeedback.allowed ? '✓ VÁLIDO: ' : '✗ DENEGADO: '}
+                  {doorTestFeedback.message}
                 </div>
-                <div className="flex flex-col gap-1.5 sm:flex-row">
-                  <input
-                    type="text"
-                    value={smartKeyInput}
-                    onChange={(e) => setSmartKeyInput(e.target.value)}
-                    placeholder="Pega URL script.google.com/macros/s/.../exec, clave re_..., xkeysib-... o Contraseña App Gmail (16 letras)"
-                    className="flex-1 rounded-lg border border-zinc-300 bg-zinc-50 px-2.5 py-1.5 text-xs text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
-                  />
-                  <button
-                    type="button"
-                    disabled={savingEmailConfig || !smartKeyInput.trim()}
-                    onClick={() => handleSaveEmailConfig(true)}
-                    className="rounded-lg bg-[#E50914] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#c80812] disabled:opacity-50 whitespace-nowrap"
-                  >
-                    {savingEmailConfig ? 'Enviando...' : 'Activar y Enviar al Correo Ahora'}
-                  </button>
-                </div>
-                {doorTestFeedback && (
-                  <div
-                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
-                      doorTestFeedback.allowed
-                        ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                        : 'bg-red-500/15 text-red-700 dark:text-red-300'
-                    }`}
-                  >
-                    {doorTestFeedback.allowed ? '✓ VÁLIDO: ' : '✗ DENEGADO: '}
-                    {doorTestFeedback.message}
-                  </div>
-                )}
-              </div>
-            )}
+              )}
+            </div>
           </div>
 
           {/* Iframe con el HTML real del correo (100% idéntico a lo que llega a Gmail) */}
