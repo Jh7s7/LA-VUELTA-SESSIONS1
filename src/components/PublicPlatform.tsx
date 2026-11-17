@@ -275,11 +275,26 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
   } | null>(null);
   const [sendingWalletTicketId, setSendingWalletTicketId] = useState<string | null>(null);
   const [walletEmailPreview, setWalletEmailPreview] = useState<{
+    ticketId?: string;
+    qrPayload?: string;
     recipient: string;
     ticketCode: string;
     emailHtml: string;
     sentRealSmtp?: boolean;
   } | null>(null);
+
+  const getLocalAutoEmailConfig = (): Record<string, string> | undefined => {
+    try {
+      const raw = localStorage.getItem('lv_auto_email_config');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return undefined;
+  };
 
   const sendBuyerTicketEmail = async (ticketId: string) => {
     setSendingWalletTicketId(ticketId);
@@ -289,13 +304,18 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
         sentRealSmtp?: boolean;
         recipient: string;
         ticketCode: string;
+        ticketId?: string;
+        qrPayload?: string;
         emailHtml?: string;
       }>('POST', '/api/tickets/resend', {
         ticketId,
         email: currentUser?.email,
+        emailConfig: getLocalAutoEmailConfig(),
       });
       if (resp.emailHtml) {
         setWalletEmailPreview({
+          ticketId: resp.ticketId || ticketId,
+          qrPayload: resp.qrPayload,
           recipient: resp.recipient,
           ticketCode: resp.ticketCode,
           emailHtml: resp.emailHtml,
@@ -304,8 +324,8 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
       }
       onNotify(
         resp.sentRealSmtp
-          ? `Entrada ${resp.ticketCode} enviada a ${resp.recipient}.`
-          : `Pase digital ${resp.ticketCode} generado para ${resp.recipient}.`,
+          ? `Entrada ${resp.ticketCode} enviada automáticamente a ${resp.recipient}.`
+          : `Pase digital ${resp.ticketCode} generado al instante para ${resp.recipient}.`,
         'success'
       );
     } catch (err: any) {
@@ -688,6 +708,7 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
         payerPhone: cleanPayerPhone,
         payerEmail: cleanPayerEmail,
         voucherDataUrl,
+        emailConfig: getLocalAutoEmailConfig(),
       });
 
       const orderResult = resp?.order;
@@ -695,6 +716,8 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
       const emailPreviewObj =
         dispatch && dispatch.emailHtml
           ? {
+              ticketId: dispatch.ticketId,
+              qrPayload: dispatch.qrPayload,
               recipient: dispatch.recipient || cleanPayerEmail || currentUser.email,
               ticketCode: dispatch.ticketCode || orderResult?.id || 'PASE-QR',
               emailHtml: dispatch.emailHtml,
@@ -3239,7 +3262,7 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
 
                 {walletEmailPreview && (
                   <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-                    <div className="relative flex h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950">
+                    <div className="relative flex h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950">
                       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 bg-zinc-50 px-5 py-3.5 dark:border-zinc-800 dark:bg-zinc-900">
                         <div>
                           <h3 className="text-xs font-bold text-zinc-900 dark:text-white">
@@ -3249,15 +3272,29 @@ export const PublicPlatform: React.FC<PublicPlatformProps> = ({
                             Destinatario: {walletEmailPreview.recipient}
                           </p>
                         </div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <a
-                            href={`/api/tickets/qr/${encodeURIComponent(walletEmailPreview.ticketCode)}.png`}
+                            href={`/api/tickets/qr/${encodeURIComponent(walletEmailPreview.ticketCode)}.png?payload=${encodeURIComponent(walletEmailPreview.qrPayload || '')}`}
                             download={`Pase-QR-${walletEmailPreview.ticketCode}.png`}
-                            className="inline-flex items-center gap-1.5 rounded-lg bg-[#E50914] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#c80812]"
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs font-semibold text-zinc-800 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
                           >
                             <Ticket className="h-3.5 w-3.5" />
                             <span>Descargar QR (PNG)</span>
                           </a>
+                          {walletEmailPreview.ticketId && (
+                            <button
+                              type="button"
+                              disabled={sendingWalletTicketId === walletEmailPreview.ticketId}
+                              onClick={() => sendBuyerTicketEmail(walletEmailPreview.ticketId!)}
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-[#E50914] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#c80812] disabled:opacity-50"
+                            >
+                              <span>
+                                {sendingWalletTicketId === walletEmailPreview.ticketId
+                                  ? 'Enviando...'
+                                  : 'Reenviar a mi Correo'}
+                              </span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => setWalletEmailPreview(null)}

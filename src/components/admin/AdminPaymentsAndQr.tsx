@@ -33,6 +33,7 @@ import {
   TicketRecord,
 } from '../../types';
 import { apiRequest, fileToValidatedDataUrl } from '../../lib/api';
+import { connectGoogleGmailSenderPopup } from '../../lib/firebase';
 import { QrCodeBox } from '../VisualArtwork';
 import { ValidatorTerminalModal } from '../ValidatorTerminalModal';
 import { formatSeatDisplay } from '../VenueStageMap';
@@ -290,6 +291,78 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     img.src = url;
   };
 
+  const getStoredEmailConfig = (): Record<string, string> => {
+    try {
+      const raw = localStorage.getItem('lv_auto_email_config');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return {};
+  };
+
+  const saveStoredEmailConfig = (partial: Record<string, string | undefined>) => {
+    try {
+      const current = getStoredEmailConfig();
+      const next: Record<string, string> = { ...current };
+      for (const [k, v] of Object.entries(partial)) {
+        if (v && v.trim()) {
+          next[k] = v.trim();
+        }
+      }
+      localStorage.setItem('lv_auto_email_config', JSON.stringify(next));
+      return next;
+    } catch {
+      return {};
+    }
+  };
+
+  const [gmailWebhookInput, setGmailWebhookInput] = useState('');
+  const [gmailUserInput, setGmailUserInput] = useState('forgen122@gmail.com');
+  const [gmailPassInput, setGmailPassInput] = useState('');
+  const [brevoKeyInput, setBrevoKeyInput] = useState('');
+  const [resendKeyInput, setResendKeyInput] = useState('');
+  const [emailFromInput, setEmailFromInput] = useState('');
+  const [smartKeyInput, setSmartKeyInput] = useState('');
+  const [savingEmailConfig, setSavingEmailConfig] = useState(false);
+  const [connectingGoogleEmail, setConnectingGoogleEmail] = useState(false);
+  const [showEmailConfigBox, setShowEmailConfigBox] = useState(false);
+  const [emailServerConfigured, setEmailServerConfigured] = useState(false);
+
+  useEffect(() => {
+    const saved = getStoredEmailConfig();
+    if (saved.gmailWebhookUrl) setGmailWebhookInput(saved.gmailWebhookUrl);
+    if (saved.gmailUser) setGmailUserInput(saved.gmailUser);
+    if (saved.emailFrom) setEmailFromInput(saved.emailFrom);
+
+    // Sync localStorage email config to server automatically on load (handles Render container restarts)
+    void (async () => {
+      try {
+        const status = await apiRequest<{
+          configured: boolean;
+          gmailWebhookConfigured?: boolean;
+          gmailOAuthConfigured?: boolean;
+          gmailUser?: string;
+        }>('GET', '/api/admin/email-config');
+        if (status.configured) {
+          setEmailServerConfigured(true);
+        } else if (Object.keys(saved).length > 0) {
+          const restored = await apiRequest<{ ok: boolean; configured: boolean }>(
+            'POST',
+            '/api/admin/email-config',
+            saved
+          );
+          if (restored.configured) setEmailServerConfigured(true);
+        }
+      } catch {
+        // ignore if user lacks admin_email_config permission
+      }
+    })();
+  }, []);
+
   const handleSendTicketEmail = async (
     overrideTicketId?: string,
     overrideOrderId?: string,
@@ -343,25 +416,19 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         orderId: overrideOrderId || undefined,
         email: recipientTarget,
         createDemoIfMissing: !targetTicketId && !overrideOrderId,
+        emailConfig: getStoredEmailConfig(),
       });
 
       setEmailTestResult(resp);
       setShowEmailPreviewModal(true);
       setSendingTestEmail(false);
 
-      if (resp.hmacVerified !== false) {
-        setDoorTestFeedback({
-          tested: true,
-          allowed: true,
-          message:
-            'Firma criptográfica HMAC-SHA256 verificada · Pase VÁLIDO (sin usar) listo para escanear en puerta.',
-          ticketCode: resp.ticketCode,
-          timestamp: new Date().toLocaleTimeString(),
-        });
-      }
-
       if (resp.sentRealSmtp) {
-        onNotify(`Pase ${resp.ticketCode} enviado automáticamente a ${resp.recipient}.`, 'success');
+        setEmailServerConfigured(true);
+        onNotify(
+          `¡Enviado automáticamente! Pase ${resp.ticketCode} entregado en la bandeja de ${resp.recipient}.`,
+          'success'
+        );
       } else {
         onNotify(
           `Pase QR ${resp.ticketCode} generado al instante para ${resp.recipient}.`,
@@ -376,55 +443,108 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     }
   };
 
-  const [gmailWebhookInput, setGmailWebhookInput] = useState('');
-  const [gmailUserInput, setGmailUserInput] = useState('forgen122@gmail.com');
-  const [gmailPassInput, setGmailPassInput] = useState('');
-  const [brevoKeyInput, setBrevoKeyInput] = useState('');
-  const [resendKeyInput, setResendKeyInput] = useState('');
-  const [emailFromInput, setEmailFromInput] = useState('');
-  const [savingEmailConfig, setSavingEmailConfig] = useState(false);
-  const [showEmailConfigBox, setShowEmailConfigBox] = useState(false);
-
   const GOOGLE_APPS_SCRIPT_SNIPPET = `function doPost(e) {
-  var data = JSON.parse(e.postData.contents);
-  var inlineImages = {};
-  var blobs = [];
-  if (data.attachments) {
-    data.attachments.forEach(function(att, i) {
-      var blob = Utilities.newBlob(Utilities.base64Decode(att.content), 'image/png', att.filename);
-      inlineImages['qr_' + i] = blob;
-      blobs.push(blob);
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var blobs = [];
+    if (data.attachments && data.attachments.length) {
+      for (var i = 0; i < data.attachments.length; i++) {
+        var att = data.attachments[i];
+        blobs.push(Utilities.newBlob(Utilities.base64Decode(att.content), 'image/png', att.filename || ('Pase-QR-' + i + '.png')));
+      }
+    }
+    MailApp.sendEmail({
+      to: data.to,
+      subject: data.subject,
+      htmlBody: data.htmlBody,
+      name: 'LA VUELTA SESSIONS',
+      attachments: blobs
     });
+    return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: String(err) })).setMimeType(ContentService.MimeType.JSON);
   }
-  GmailApp.sendEmail(data.to, data.subject, '', {
-    htmlBody: data.htmlBody,
-    inlineImages: inlineImages,
-    attachments: blobs,
-    name: 'LA VUELTA SESSIONS'
-  });
-  return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
 }`;
 
-  const handleSaveEmailConfig = async () => {
+  const handleConnectGoogleGmailScope = async (resendAfterConnect = false) => {
+    setConnectingGoogleEmail(true);
+    try {
+      const { email, accessToken } = await connectGoogleGmailSenderPopup();
+      const merged = saveStoredEmailConfig({
+        gmailUser: email,
+        gmailAccessToken: accessToken,
+      });
+      await apiRequest('POST', '/api/admin/email-config', merged);
+      setEmailServerConfigured(true);
+      onNotify(
+        `¡Cuenta de Google (${email}) vinculada para envío automático de entradas QR!`,
+        'success'
+      );
+      if (resendAfterConnect && emailTestResult) {
+        await handleSendTicketEmail(
+          emailTestResult.ticketId,
+          undefined,
+          emailTestResult.recipient
+        );
+      }
+    } catch (err: any) {
+      const msg = String(err?.message || err || '');
+      setShowEmailConfigBox(true);
+      if (msg.includes('unauthorized-domain')) {
+        onNotify(
+          'En Render usa el Puente Gmail HTTPS de 1 clic o pega tu clave/contraseña de aplicación en la barra inferior.',
+          'info'
+        );
+      } else {
+        onNotify(
+          'Pega tu URL del Puente Gmail HTTPS o Contraseña de Aplicación para activar el envío automático.',
+          'info'
+        );
+      }
+    } finally {
+      setConnectingGoogleEmail(false);
+    }
+  };
+
+  const handleSaveEmailConfig = async (resendTicketAfterSave?: boolean) => {
     setSavingEmailConfig(true);
     try {
-      await apiRequest('POST', '/api/admin/email-config', {
+      const payload = {
+        smartKey: smartKeyInput.trim() || undefined,
         gmailWebhookUrl: gmailWebhookInput.trim() || undefined,
         gmailUser: gmailUserInput.trim() || undefined,
         gmailAppPassword: gmailPassInput.trim() || undefined,
         brevoApiKey: brevoKeyInput.trim() || undefined,
         resendApiKey: resendKeyInput.trim() || undefined,
         emailFrom: emailFromInput.trim() || undefined,
-      });
+      };
+      const merged = saveStoredEmailConfig(payload);
+      const resp = await apiRequest<{ ok: boolean; configured: boolean }>(
+        'POST',
+        '/api/admin/email-config',
+        merged
+      );
+      if (resp.configured) {
+        setEmailServerConfigured(true);
+      }
       onNotify(
-        'Configuración de envío automático guardada. Las entradas con código QR se enviarán automáticamente en cada compra, emisión y simulación.',
+        '¡Envío automático activado! Todas las entradas QR se enviarán directo al correo en compras, aprobaciones y simulaciones.',
         'success'
       );
       setGmailPassInput('');
       setBrevoKeyInput('');
       setResendKeyInput('');
+      setSmartKeyInput('');
       setShowEmailConfigBox(false);
-      void onRefresh();
+      if (resendTicketAfterSave && emailTestResult) {
+        await handleSendTicketEmail(
+          emailTestResult.ticketId,
+          undefined,
+          emailTestResult.recipient
+        );
+      } else {
+        void onRefresh();
+      }
     } catch (err: any) {
       onNotify(err.message || 'Error al guardar configuración de correo.', 'error');
     } finally {
@@ -499,7 +619,10 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         order: OrderRecord;
         issuedTickets?: TicketRecord[];
         emailDispatch?: any;
-      }>('POST', `/api/admin/orders/${orderId}/${action}`, { notes });
+      }>('POST', `/api/admin/orders/${orderId}/${action}`, {
+        notes,
+        emailConfig: getStoredEmailConfig(),
+      });
 
       setVoucherModal(null);
       setProcessingOrderId(null);
@@ -539,17 +662,8 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
 
   const renderEmailPreviewModal = () => {
     if (!showEmailPreviewModal || !emailTestResult) return null;
-    const qrImageHref = `/api/tickets/qr/${encodeURIComponent(emailTestResult.ticketCode)}.png`;
-    const gmailComposeUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(
-      emailTestResult.recipient
-    )}&su=${encodeURIComponent(
-      emailTestResult.subject || `🎟️ Tu Pase Digital QR [${emailTestResult.ticketCode}]`
-    )}&body=${encodeURIComponent(
-      `¡Hola!\n\nAquí tienes tu Pase Digital Oficial para LA VUELTA SESSIONS:\n\n` +
-        `• Código de Entrada: ${emailTestResult.ticketCode}\n` +
-        `• Descargar imagen QR directa: ${window.location.origin}${qrImageHref}\n` +
-        `• Billetera Digital: ${window.location.origin}\n\n` +
-        `Presenta tu código QR en la entrada del evento para validación con LK-Validador.`
+    const qrImageHref = `/api/tickets/qr/${encodeURIComponent(emailTestResult.ticketCode)}.png?payload=${encodeURIComponent(
+      emailTestResult.qrPayload || ''
     )}`;
 
     return (
@@ -581,15 +695,23 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
               >
                 <span>Descargar QR (PNG)</span>
               </a>
-              <a
-                href={gmailComposeUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-[#E50914] hover:bg-red-500/20"
+              <button
+                type="button"
+                disabled={sendingTestEmail}
+                onClick={() =>
+                  handleSendTicketEmail(
+                    emailTestResult.ticketId,
+                    undefined,
+                    emailTestResult.recipient
+                  )
+                }
+                className="inline-flex items-center gap-1 rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-[#E50914] hover:bg-red-500/20 disabled:opacity-50"
               >
                 <Send className="h-3 w-3" />
-                <span>Abrir en Gmail (1 Clic)</span>
-              </a>
+                <span>
+                  {sendingTestEmail ? 'Enviando...' : 'Reenviar Automáticamente al Correo'}
+                </span>
+              </button>
               <button
                 type="button"
                 disabled={testingDoorValidation}
@@ -624,40 +746,90 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
             </div>
           </div>
 
-          {/* Barra superior con QR instantáneo para escanear directo con la APK LK-Validador sin hacer scroll */}
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 bg-white px-4 py-2.5 dark:border-zinc-800 dark:bg-zinc-950">
-            <div className="flex items-center gap-3">
-              <div className="rounded-lg bg-white p-1 border border-zinc-200 shadow-xs shrink-0">
-                <QrCodeBox payload={emailTestResult.qrPayload} size={84} />
-              </div>
-              <div className="text-xs space-y-0.5">
-                <div className="inline-flex items-center gap-1 text-[11px] font-bold text-[#E50914]">
-                  <Smartphone className="h-3.5 w-3.5" />
-                  <span>LISTO PARA ESCANEAR CON APK LK-VALIDADOR</span>
+          {/* Barra de estado de entrega automática a bandeja o feedback de validación en puerta */}
+          <div className="border-b border-zinc-200 bg-white px-4 py-2 dark:border-zinc-800 dark:bg-zinc-950">
+            {emailTestResult.sentRealSmtp ? (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    Correo HTML con Pase QR entregado automáticamente en la bandeja de{' '}
+                    <strong>{emailTestResult.recipient}</strong>
+                  </span>
                 </div>
-                <p className="font-mono text-xs font-bold text-zinc-900 dark:text-white">
-                  Código: {emailTestResult.ticketCode}
-                </p>
-                <p className="text-[11px] text-zinc-500">
-                  {emailTestResult.providerNote}
-                </p>
+                {doorTestFeedback && (
+                  <div
+                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
+                      doorTestFeedback.allowed
+                        ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                        : 'bg-red-500/15 text-red-700 dark:text-red-300'
+                    }`}
+                  >
+                    {doorTestFeedback.allowed ? '✓ VÁLIDO: ' : '✗ DENEGADO: '}
+                    {doorTestFeedback.message}
+                  </div>
+                )}
               </div>
-            </div>
-            {doorTestFeedback && (
-              <div
-                className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-                  doorTestFeedback.allowed
-                    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                    : 'bg-red-500/15 text-red-700 dark:text-red-300'
-                }`}
-              >
-                {doorTestFeedback.allowed ? '✓ VÁLIDO: ' : '✗ DENEGADO: '}
-                {doorTestFeedback.message}
+            ) : (
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                    ⚡ Activa aquí en 1 paso el envío automático a bandeja (tipo Google) para que llegue al correo sin abrir ventanas:
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={connectingGoogleEmail}
+                      onClick={() => handleConnectGoogleGmailScope(true)}
+                      className="rounded-md bg-blue-600 px-2.5 py-1 text-[10px] font-bold text-white hover:bg-blue-700 disabled:opacity-50"
+                    >
+                      {connectingGoogleEmail ? 'Conectando...' : 'Vincular Google (1 Clic)'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyField('Código Puente Gmail Automático', GOOGLE_APPS_SCRIPT_SNIPPET)
+                      }
+                      className="rounded-md border border-zinc-300 px-2 py-1 text-[10px] font-semibold text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                    >
+                      Copiar Script Gmail
+                    </button>
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1.5 sm:flex-row">
+                  <input
+                    type="text"
+                    value={smartKeyInput}
+                    onChange={(e) => setSmartKeyInput(e.target.value)}
+                    placeholder="Pega URL script.google.com/macros/s/.../exec, clave re_..., xkeysib-... o Contraseña App Gmail (16 letras)"
+                    className="flex-1 rounded-lg border border-zinc-300 bg-zinc-50 px-2.5 py-1.5 text-xs text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                  />
+                  <button
+                    type="button"
+                    disabled={savingEmailConfig || !smartKeyInput.trim()}
+                    onClick={() => handleSaveEmailConfig(true)}
+                    className="rounded-lg bg-[#E50914] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#c80812] disabled:opacity-50 whitespace-nowrap"
+                  >
+                    {savingEmailConfig ? 'Enviando...' : 'Activar y Enviar al Correo Ahora'}
+                  </button>
+                </div>
+                {doorTestFeedback && (
+                  <div
+                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
+                      doorTestFeedback.allowed
+                        ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                        : 'bg-red-500/15 text-red-700 dark:text-red-300'
+                    }`}
+                  >
+                    {doorTestFeedback.allowed ? '✓ VÁLIDO: ' : '✗ DENEGADO: '}
+                    {doorTestFeedback.message}
+                  </div>
+                )}
               </div>
             )}
           </div>
 
-          {/* Iframe con el HTML real del correo */}
+          {/* Iframe con el HTML real del correo (100% idéntico a lo que llega a Gmail) */}
           <div className="flex-1 bg-zinc-900 p-2 overflow-hidden">
             {emailTestResult.emailHtml ? (
               <iframe
@@ -1103,7 +1275,13 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                 className="inline-flex items-center gap-1.5 rounded-full border border-zinc-300 bg-zinc-100 px-3 py-1 text-[11px] font-semibold text-zinc-700 hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
               >
                 <Mail className="h-3 w-3 text-[#E50914]" />
-                <span>{showEmailConfigBox ? 'Ocultar Config. Correo' : 'Configurar Envío Automático a Bandeja'}</span>
+                <span>
+                  {showEmailConfigBox
+                    ? 'Ocultar Config. Correo'
+                    : emailServerConfigured
+                      ? '✓ Envío Automático a Bandeja Activo'
+                      : 'Configurar Envío Automático a Bandeja'}
+                </span>
               </button>
               <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -1133,15 +1311,25 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                     , crea un proyecto nuevo, pega el código automático de 1 clic, pulsa <em>Implementar &gt; Aplicación web (Acceso: Cualquier persona)</em> y pega aquí la URL:
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() =>
-                    copyField('Código Puente Gmail Automático', GOOGLE_APPS_SCRIPT_SNIPPET)
-                  }
-                  className="shrink-0 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-bold text-[#E50914] hover:bg-red-500/20"
-                >
-                  Copiar Código Automático (1 Clic)
-                </button>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={connectingGoogleEmail}
+                    onClick={() => handleConnectGoogleGmailScope(false)}
+                    className="shrink-0 rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-bold text-white hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {connectingGoogleEmail ? 'Conectando...' : 'Vincular con Google (OAuth 1 Clic)'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      copyField('Código Puente Gmail Automático', GOOGLE_APPS_SCRIPT_SNIPPET)
+                    }
+                    className="shrink-0 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-bold text-[#E50914] hover:bg-red-500/20"
+                  >
+                    Copiar Código Automático (1 Clic)
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
@@ -1158,7 +1346,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                   <button
                     type="button"
                     disabled={savingEmailConfig}
-                    onClick={handleSaveEmailConfig}
+                    onClick={() => handleSaveEmailConfig(false)}
                     className="w-full rounded-lg bg-[#E50914] px-3 py-2 text-xs font-semibold text-white hover:bg-[#c80812]"
                   >
                     {savingEmailConfig ? 'Guardando...' : 'Guardar y Activar'}
@@ -1168,7 +1356,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
 
               <div className="border-t border-zinc-200/70 pt-2.5 dark:border-zinc-800">
                 <p className="text-[11px] text-zinc-500 mb-2">
-                  <strong>Método B (Alternativo - Gmail SMTP / Brevo API / Resend API):</strong>
+                  <strong>Método B (Alternativo - Gmail App Password / Brevo API / Resend API):</strong>
                 </p>
                 <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
                   <input
@@ -1189,7 +1377,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                     type="password"
                     value={resendKeyInput}
                     onChange={(e) => setResendKeyInput(e.target.value)}
-                    placeholder="O clave RESEND_API_KEY (re_...)"
+                    placeholder="O clave RESEND_API_KEY (re_...) / BREVO (xkeysib-...)"
                     className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
                   />
                 </div>

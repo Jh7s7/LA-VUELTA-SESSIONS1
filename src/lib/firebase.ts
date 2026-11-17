@@ -138,3 +138,23 @@ export function getFirebaseProjectInfo() {
     oAuthClientId: firebaseConfig.oAuthClientId,
   };
 }
+
+export async function connectGoogleGmailSenderPopup(): Promise<{
+  email: string;
+  accessToken: string;
+}> {
+  const gmailScopeProvider = new GoogleAuthProvider();
+  gmailScopeProvider.addScope('https://www.googleapis.com/auth/gmail.send');
+  gmailScopeProvider.setCustomParameters({ prompt: 'consent select_account' });
+  const result = await signInWithPopup(auth, gmailScopeProvider);
+  const oauthCred = GoogleAuthProvider.credentialFromResult(result);
+  const accessToken = oauthCred?.accessToken || '';
+  if (!accessToken) {
+    throw new Error('Google no devolvió el token de envío de Gmail.');
+  }
+  return {
+    email: result.user.email || 'forgen122@gmail.com',
+    accessToken,
+  };
+}
+
