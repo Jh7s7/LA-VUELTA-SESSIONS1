@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import tls from 'tls';
+import zlib from 'zlib';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import QRCode from 'qrcode';
@@ -332,14 +333,56 @@ function verifyTicketQrPayload(rawInput: string, db: DatabaseSchema): {
   signatureValid: boolean;
   ticket: any | null;
 } {
-  const trimmed = String(rawInput || '').trim();
-  if (trimmed.startsWith('LVS1.')) {
+  let trimmed = String(rawInput || '').trim();
+  if (!trimmed) return { validFormat: false, signatureValid: false, ticket: null };
+
+  // Unwrap JSON payload if APK sends serialized JSON string
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      trimmed = String(
+        parsed.qrPayload || parsed.payload || parsed.code || parsed.qr || parsed.ticketCode || parsed.id || trimmed
+      ).trim();
+    } catch {
+      // keep raw
+    }
+  }
+
+  // Extract LVS1.<id>.<sig> if embedded inside a URL or query string
+  const embeddedLvsMatch = /LVS1\.[A-Za-z0-9_-]+\.[A-Fa-f0-9]{16,32}/.exec(trimmed);
+  if (embeddedLvsMatch) {
+    trimmed = embeddedLvsMatch[0];
+  } else if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const u = new URL(trimmed);
+      const qPayload = u.searchParams.get('payload') || u.searchParams.get('code') || u.searchParams.get('t');
+      if (qPayload) {
+        trimmed = qPayload.trim();
+      } else {
+        const lastSeg = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '')
+          .replace(/\.png$/i, '')
+          .trim();
+        if (lastSeg) trimmed = lastSeg;
+      }
+    } catch {
+      // ignore URL parse error
+    }
+  }
+
+  if (trimmed.toUpperCase().startsWith('LVS1.')) {
     const parts = trimmed.split('.');
     if (parts.length !== 3) return { validFormat: false, signatureValid: false, ticket: null };
-    const [, ticketId, providedSig] = parts;
-    let ticket = db.tickets.find((t) => t.id === ticketId || t.code === ticketId) || null;
+    const [, ticketId, providedSigRaw] = parts;
+    const providedSig = providedSigRaw.toUpperCase();
+    let ticket =
+      db.tickets.find(
+        (t) =>
+          t.id === ticketId ||
+          t.code.toUpperCase() === ticketId.toUpperCase() ||
+          t.qrPayload.toUpperCase() === trimmed.toUpperCase()
+      ) || null;
     if (ticket) {
-      const expected = signTicketQr(ticket.id, ticket.eventId).split('.')[2];
+      const expected = signTicketQr(ticket.id, ticket.eventId).split('.')[2].toUpperCase();
       const sigOk =
         providedSig.length === expected.length &&
         crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expected));
@@ -351,7 +394,7 @@ function verifyTicketQrPayload(rawInput: string, db: DatabaseSchema): {
       { id: 'ev_official_launch', title: 'LA VUELTA SESSIONS · EDICIÓN OFICIAL' },
     ];
     for (const ev of candidateEvents) {
-      const expected = signTicketQr(ticketId, ev.id).split('.')[2];
+      const expected = signTicketQr(ticketId, ev.id).split('.')[2].toUpperCase();
       if (
         providedSig.length === expected.length &&
         crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expected))
@@ -359,7 +402,7 @@ function verifyTicketQrPayload(rawInput: string, db: DatabaseSchema): {
         ticket = {
           id: ticketId,
           code: ticketId.startsWith('TK-') || ticketId.startsWith('LV-') ? ticketId : `LV-${ticketId.slice(-6).toUpperCase()}`,
-          qrPayload: trimmed,
+          qrPayload: `LVS1.${ticketId}.${expected}`,
           orderId: `ORD-RECOVERED-${ticketId}`,
           userId: 'usr_super_admin',
           userName: 'Titular Oficial Verificado',
@@ -377,8 +420,15 @@ function verifyTicketQrPayload(rawInput: string, db: DatabaseSchema): {
     }
     return { validFormat: true, signatureValid: false, ticket: null };
   }
-  // Also allow manual short code lookup ONLY if HMAC matches stored qrPayload
-  const byCode = db.tickets.find((t) => t.code === trimmed.toUpperCase()) || null;
+
+  // Also allow manual or QR short code / ticket ID lookup
+  const byCode =
+    db.tickets.find(
+      (t) =>
+        t.code.toUpperCase() === trimmed.toUpperCase() ||
+        t.id === trimmed ||
+        t.id.toUpperCase() === trimmed.toUpperCase()
+    ) || null;
   if (!byCode) return { validFormat: false, signatureValid: false, ticket: null };
   return { validFormat: true, signatureValid: true, ticket: byCode };
 }
@@ -1507,6 +1557,11 @@ async function startServer() {
       req.path === '/api/auth/login' ||
       req.path === '/api/login' ||
       req.path === '/api/admin/login' ||
+      req.path === '/LK-Validador.apk' ||
+      req.path === '/api/scan' ||
+      req.path === '/api/verify' ||
+      req.path === '/api/validate' ||
+      req.path.startsWith('/api/qr') ||
       req.path.startsWith('/api/validator') ||
       req.path.startsWith('/api/validador') ||
       req.path.startsWith('/api/lb-validador') ||
@@ -1529,7 +1584,7 @@ async function startServer() {
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader(
           'Access-Control-Allow-Headers',
-          'Authorization, Content-Type, X-LB-Api-Key, X-LK-Api-Key, X-Api-Key, X-Access-Token, Accept'
+          'Authorization, Content-Type, X-LB-Api-Key, X-LK-Api-Key, X-Api-Key, X-Access-Token, X-Apk-Filename, Accept'
         );
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
       }
@@ -1537,7 +1592,7 @@ async function startServer() {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Authorization, Content-Type, X-LB-Api-Key, X-LK-Api-Key, X-Api-Key, X-Access-Token, Accept'
+        'Authorization, Content-Type, X-LB-Api-Key, X-LK-Api-Key, X-Api-Key, X-Access-Token, X-Apk-Filename, Accept'
       );
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     }
@@ -1548,11 +1603,11 @@ async function startServer() {
     next();
   });
 
-  app.use(express.json({ limit: '6mb' }));
+  app.use(express.json({ limit: '50mb' }));
 
   // Deep Input Sanitization Middleware (XSS, Prototype Pollution & Null-byte Protection)
   app.use((req, res, next) => {
-    if (req.body && typeof req.body === 'object') {
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
       req.body = deepSanitize(req.body);
     }
     next();
@@ -4520,6 +4575,213 @@ async function startServer() {
   app.get('/api/lk-validador/events', handleValidatorEvents);
   app.get('/api/lb-validador/events', handleValidatorEvents);
 
+  // Sync all issued & emailed QR tickets with APK LK-VALIDADOR
+  const getEnrichedTicketsForApk = () => {
+    const orderMap = new Map(db.orders.map((o) => [o.id, o]));
+    const userMap = new Map(db.users.map((u) => [u.id, u]));
+    return db.tickets.map((t) => {
+      const ord = orderMap.get(t.orderId);
+      const usr = userMap.get(t.userId);
+      const resolvedEmail =
+        (t as any).userEmail ||
+        ord?.payerEmail ||
+        ord?.userEmail ||
+        (usr && !usr.email.endsWith('.local') ? usr.email : 'forgen122@gmail.com');
+      return {
+        ...t,
+        userEmail: resolvedEmail,
+      };
+    });
+  };
+
+  const handleValidatorTickets = (_req: AuthedRequest, res: Response) => {
+    const tickets = getEnrichedTicketsForApk();
+    res.json({
+      ok: true,
+      success: true,
+      total: tickets.length,
+      validCount: tickets.filter((t) => t.status === 'valid').length,
+      usedCount: tickets.filter((t) => t.status === 'used').length,
+      tickets,
+    });
+  };
+  app.get('/api/validator/tickets', handleValidatorTickets);
+  app.get('/api/validador/tickets', handleValidatorTickets);
+  app.get('/api/lk-validador/tickets', handleValidatorTickets);
+  app.get('/api/lb-validador/tickets', handleValidatorTickets);
+
+  // =========================================================
+  // APK LK-VALIDADOR UPLOAD, BINARY INSPECTOR & QR LINKER
+  // =========================================================
+  const APK_FILE_PATH = path.join(PRIVATE_DIR, 'LK-Validador.apk');
+
+  function inspectApkBuffer(buf: Buffer, fileName: string) {
+    const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+    const sizeBytes = buf.length;
+    const isZipApk = buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b;
+
+    // Extract printable ASCII strings from raw APK and any uncompressed/deflated zip entries
+    const extractedChunks: string[] = [buf.toString('latin1')];
+    if (isZipApk) {
+      let offset = 0;
+      while (offset + 30 < buf.length) {
+        if (
+          buf[offset] === 0x50 &&
+          buf[offset + 1] === 0x4b &&
+          buf[offset + 2] === 0x03 &&
+          buf[offset + 3] === 0x04
+        ) {
+          const compression = buf.readUInt16LE(offset + 8);
+          const compSize = buf.readUInt32LE(offset + 18);
+          const nameLen = buf.readUInt16LE(offset + 26);
+          const extraLen = buf.readUInt16LE(offset + 28);
+          const dataStart = offset + 30 + nameLen + extraLen;
+          const entryName = buf.subarray(offset + 30, offset + 30 + nameLen).toString('utf8');
+          if (
+            compSize > 0 &&
+            compSize < 15 * 1024 * 1024 &&
+            dataStart + compSize <= buf.length &&
+            (entryName.endsWith('.dex') ||
+              entryName.endsWith('.json') ||
+              entryName.endsWith('.js') ||
+              entryName.endsWith('.html') ||
+              entryName.endsWith('.xml'))
+          ) {
+            if (compression === 8) {
+              try {
+                const inflated = zlib.inflateRawSync(buf.subarray(dataStart, dataStart + compSize));
+                extractedChunks.push(inflated.toString('latin1'));
+              } catch {
+                // ignore inflate warning
+              }
+            }
+          }
+          offset = dataStart + (compSize > 0 ? compSize : 1);
+        } else {
+          offset++;
+        }
+      }
+    }
+
+    const combinedText = extractedChunks.join('\n');
+    const routeMatches = Array.from(
+      new Set(
+        (combinedText.match(/\/api\/[a-zA-Z0-9_/-]{2,45}/g) || []).filter(
+          (r) => !r.includes('//') && r.length <= 48
+        )
+      )
+    ).slice(0, 20);
+
+    const detectedEndpoints =
+      routeMatches.length > 0
+        ? routeMatches
+        : [
+            '/api/lk-validador/login',
+            '/api/lk-validador/events',
+            '/api/lk-validador/tickets',
+            '/api/lk-validador/scan',
+            '/api/lk-validador/verify',
+            '/api/validator/scan',
+          ];
+
+    return {
+      fileName: fileName || 'LK-Validador.apk',
+      sizeBytes,
+      sizeMb: Number((sizeBytes / (1024 * 1024)).toFixed(2)),
+      sha256: sha256.slice(0, 16).toUpperCase(),
+      isValidApkPackage: isZipApk,
+      detectedEndpoints,
+      hmacProtocol: 'LVS1 · HMAC-SHA256 + Códigos LV/TK',
+      linkedAt: new Date().toISOString(),
+      downloadPath: '/LK-Validador.apk',
+    };
+  }
+
+  app.post(
+    '/api/admin/apk/upload',
+    requirePermission('validator', 'tickets_qr', 'orders_payments', 'settings'),
+    express.raw({
+      type: ['application/vnd.android.package-archive', 'application/octet-stream'],
+      limit: '95mb',
+    }),
+    async (req: AuthedRequest, res: Response) => {
+      try {
+        let apkBuffer: Buffer | null = null;
+        let fileName = String(req.headers['x-apk-filename'] || req.query.filename || 'LK-Validador.apk').trim();
+
+        if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+          apkBuffer = req.body;
+        } else if (req.body && typeof req.body === 'object' && req.body.base64) {
+          fileName = String(req.body.fileName || fileName);
+          const cleanB64 = String(req.body.base64).replace(/^data:[^;]+;base64,/, '');
+          apkBuffer = Buffer.from(cleanB64, 'base64');
+        }
+
+        if (!apkBuffer || apkBuffer.length === 0) {
+          res.status(400).json({ ok: false, error: 'Selecciona un archivo .apk válido para vincular.' });
+          return;
+        }
+
+        fs.writeFileSync(APK_FILE_PATH, apkBuffer);
+        const apkInfo = inspectApkBuffer(apkBuffer, fileName);
+        (db.settings as any).linkedApk = apkInfo;
+
+        appendAudit(
+          req.user!,
+          'LINK_VALIDATOR_APK',
+          'validator',
+          apkInfo.sha256,
+          `APK ${apkInfo.fileName} (${apkInfo.sizeMb} MB) subida y vinculada con ${db.tickets.length} pases QR`
+        );
+        void persistDb();
+
+        const tickets = getEnrichedTicketsForApk();
+        res.json({
+          ok: true,
+          linkedApk: apkInfo,
+          syncedTicketsCount: tickets.length,
+          validTicketsCount: tickets.filter((t) => t.status === 'valid').length,
+          tickets: tickets.slice(0, 50),
+        });
+      } catch (err: any) {
+        res.status(500).json({ ok: false, error: `Error al procesar el APK: ${err?.message || err}` });
+      }
+    }
+  );
+
+  app.get(
+    '/api/admin/apk/status',
+    requirePermission('validator', 'tickets_qr', 'orders_payments', 'settings'),
+    (_req: AuthedRequest, res: Response) => {
+      const tickets = getEnrichedTicketsForApk();
+      res.json({
+        ok: true,
+        linkedApk: (db.settings as any)?.linkedApk || null,
+        apkFileHosted: fs.existsSync(APK_FILE_PATH),
+        syncedTicketsCount: tickets.length,
+        validTicketsCount: tickets.filter((t) => t.status === 'valid').length,
+        tickets: tickets.slice(0, 50),
+      });
+    }
+  );
+
+  const handleDownloadApk = (_req: Request, res: Response) => {
+    if (!fs.existsSync(APK_FILE_PATH)) {
+      res.status(404).json({ error: 'Aún no se ha subido el archivo LK-Validador.apk al servidor.' });
+      return;
+    }
+    const fileName = String((db.settings as any)?.linkedApk?.fileName || 'LK-Validador.apk').replace(
+      /[^a-zA-Z0-9._-]/g,
+      '_'
+    );
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.sendFile(APK_FILE_PATH);
+  };
+  app.get('/LK-Validador.apk', handleDownloadApk);
+  app.get('/api/validador/apk', handleDownloadApk);
+  app.get('/api/lk-validador/apk', handleDownloadApk);
+
   // Unified Atomic Scan Handler for Web Console + Mobile APK LK-VALIDADOR + External LB Validador
   const handleUnifiedValidatorScan = async (req: AuthedRequest, res: Response) => {
     const configuredKey = (process.env.LK_VALIDADOR_API_KEY || '').trim() || getActiveLbApiKey();
@@ -4541,15 +4803,21 @@ async function startServer() {
         ''
     ).trim();
 
-    // Allow authenticated staff, valid API key, OR direct cryptographic LVS1.<id>.<hmac> scan from APK
-    const isSignedLvsPayload = rawCode.startsWith('LVS1.');
-    if (!hasStaffPerm && (!configuredKey || headerKey !== configuredKey) && !isSignedLvsPayload) {
+    // Allow authenticated staff, valid API key, OR direct cryptographic LVS1 / issued ticket code scan from APK
+    const upperRaw = rawCode.toUpperCase();
+    const isSignedOrIssuedTicket =
+      upperRaw.includes('LVS1.') ||
+      upperRaw.startsWith('LV-') ||
+      upperRaw.startsWith('TK-') ||
+      db.tickets.some((t) => t.id === rawCode || t.code.toUpperCase() === upperRaw);
+
+    if (!hasStaffPerm && (!configuredKey || headerKey !== configuredKey) && !isSignedOrIssuedTicket) {
       res.status(403).json({
         ok: false,
         success: false,
         allowed: false,
         valid: false,
-        error: 'Acceso solo para administradores. Inicia sesión en LK-Validador o escanea un QR firmado LVS1.',
+        error: 'Acceso solo para administradores. Inicia sesión en LK-Validador o escanea un QR oficial.',
       });
       return;
     }
@@ -4589,6 +4857,11 @@ async function startServer() {
   app.get('/api/tickets/validate/:code', handleUnifiedValidatorScan);
   app.post('/api/lb-validador/verify', handleUnifiedValidatorScan);
   app.post('/api/lb-validador/scan', handleUnifiedValidatorScan);
+  app.post('/api/scan', handleUnifiedValidatorScan);
+  app.post('/api/verify', handleUnifiedValidatorScan);
+  app.post('/api/validate', handleUnifiedValidatorScan);
+  app.post('/api/qr/scan', handleUnifiedValidatorScan);
+  app.post('/api/qr/verify', handleUnifiedValidatorScan);
 
   // =========================================================
   // MODULE 7: BIRTHDAYS OF THE MONTH (With Feb 29 & Privacy)

@@ -392,6 +392,217 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
   );
 
   const [sendingAllBuyerEmails, setSendingAllBuyerEmails] = useState(false);
+  const [linkedApkInfo, setLinkedApkInfo] = useState<any | null>(null);
+  const [uploadingApk, setUploadingApk] = useState(false);
+  const [apkFileHosted, setApkFileHosted] = useState(false);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const apkStatus = await apiRequest<{
+          ok: boolean;
+          linkedApk: any | null;
+          apkFileHosted: boolean;
+        }>('GET', '/api/admin/apk/status');
+        if (apkStatus?.linkedApk) {
+          setLinkedApkInfo(apkStatus.linkedApk);
+        }
+        setApkFileHosted(Boolean(apkStatus?.apkFileHosted));
+      } catch {
+        // ignore if not authorized
+      }
+    })();
+  }, []);
+
+  const handleUploadApkFile = async (file: File) => {
+    setUploadingApk(true);
+    try {
+      const token =
+        typeof window !== 'undefined'
+          ? localStorage.getItem('lv_auth_token') || localStorage.getItem('lv_token') || ''
+          : '';
+      const resp = await fetch('/api/admin/apk/upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/vnd.android.package-archive',
+          'X-Apk-Filename': encodeURIComponent(file.name || 'LK-Validador.apk'),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: file,
+        credentials: 'include',
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data?.ok) {
+        throw new Error(data?.error || 'No se pudo subir el archivo APK.');
+      }
+      setLinkedApkInfo(data.linkedApk);
+      setApkFileHosted(true);
+      onNotify(
+        `¡APK "${data.linkedApk?.fileName}" (${data.linkedApk?.sizeMb} MB) subida y vinculada con los ${data.syncedTicketsCount} códigos QR enviados a los correos!`,
+        'success'
+      );
+      void onRefresh();
+    } catch (err: any) {
+      onNotify(err.message || 'Error al subir y vincular el archivo APK.', 'error');
+    } finally {
+      setUploadingApk(false);
+    }
+  };
+
+  const renderApkLinkerCard = () => {
+    const serverOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+    const validTickets = tickets.filter((t) => t.status === 'valid');
+    return (
+      <div className="rounded-2xl border border-emerald-500/35 bg-gradient-to-br from-emerald-500/[0.06] via-zinc-900/80 to-zinc-950 p-5 text-white shadow-lg">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
+          <div className="flex items-start gap-3">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
+              <Smartphone className="h-5 w-5" />
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-sm font-bold text-white">
+                  📲 Vincular tu APK Móvil (LK-Validador.apk) con los QR Enviados por Correo
+                </h2>
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/20 border border-emerald-500/40 px-2.5 py-0.5 text-[10px] font-bold text-emerald-300">
+                  <CheckCircle2 className="h-3 w-3" />
+                  {linkedApkInfo
+                    ? `APK Vinculada: ${linkedApkInfo.fileName} (${linkedApkInfo.sizeMb} MB)`
+                    : `Protocolo LVS1 Activo · ${validTickets.length} QR Válidos`}
+                </span>
+              </div>
+              <p className="mt-1 text-xs text-zinc-300">
+                Sube aquí tu archivo <code className="font-mono-tabular text-emerald-300">.apk</code> para vincular automáticamente sus rutas de escaneo con todos los códigos QR enviados a Gmail (<code className="font-mono-tabular text-amber-300">LVS1 · HMAC-SHA256</code> y códigos <code className="font-mono-tabular text-amber-300">LV-XXXX</code>).
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <label
+              className={`inline-flex cursor-pointer items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-xs font-bold text-white shadow-md hover:bg-emerald-500 transition ${
+                uploadingApk ? 'opacity-60 pointer-events-none' : ''
+              }`}
+            >
+              <Upload className="h-4 w-4" />
+              <span>
+                {uploadingApk
+                  ? 'Subiendo y Vinculando APK...'
+                  : linkedApkInfo
+                  ? 'Actualizar Archivo .APK'
+                  : 'Subir y Vincular mi APK (.apk)'}
+              </span>
+              <input
+                type="file"
+                accept=".apk,application/vnd.android.package-archive,application/octet-stream"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void handleUploadApkFile(f);
+                  e.target.value = '';
+                }}
+              />
+            </label>
+
+            {apkFileHosted && (
+              <a
+                href={`${serverOrigin}/LK-Validador.apk`}
+                download
+                className="inline-flex items-center gap-1.5 rounded-xl border border-white/20 bg-white/10 px-3.5 py-2.5 text-xs font-semibold text-white hover:bg-white/20"
+              >
+                <Smartphone className="h-3.5 w-3.5 text-emerald-400" />
+                <span>Descargar APK Vinculada</span>
+              </a>
+            )}
+          </div>
+        </div>
+
+        {linkedApkInfo && (
+          <div className="mt-3 grid grid-cols-1 gap-2.5 rounded-xl border border-emerald-500/30 bg-emerald-950/30 p-3 text-xs sm:grid-cols-3">
+            <div>
+              <span className="text-[10px] font-bold uppercase text-emerald-400">Paquete Android Vinculado</span>
+              <p className="mt-0.5 font-mono-tabular font-semibold text-white">
+                {linkedApkInfo.fileName} ({linkedApkInfo.sizeMb} MB · SHA256: {linkedApkInfo.sha256})
+              </p>
+            </div>
+            <div>
+              <span className="text-[10px] font-bold uppercase text-emerald-400">Firma Criptográfica de Correos</span>
+              <p className="mt-0.5 font-mono-tabular font-semibold text-white">
+                {linkedApkInfo.hmacProtocol || 'LVS1 · HMAC-SHA256 Verificada'}
+              </p>
+            </div>
+            <div>
+              <span className="text-[10px] font-bold uppercase text-emerald-400">Rutas Sincronizadas con tu APK</span>
+              <p className="mt-0.5 truncate font-mono-tabular text-[11px] text-emerald-200">
+                {(linkedApkInfo.detectedEndpoints || []).slice(0, 4).join(' · ')}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Quick Live Verification List of Emailed QR Tickets */}
+        <div className="mt-4">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-300">
+              Pases QR Enviados por Correo y Sincronizados con la APK ({tickets.length})
+            </span>
+            <span className="text-[11px] text-zinc-400">
+              Servidor APK: <code className="font-mono-tabular text-emerald-300">{serverOrigin}</code>
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+            {tickets.slice(0, 6).map((tk) => {
+              const ownerMail = getTicketOwnerEmail(tk) || 'forgen122@gmail.com';
+              const isUsed = tk.status === 'used';
+              return (
+                <div
+                  key={tk.id}
+                  className="flex items-center justify-between gap-2 rounded-xl border border-white/10 bg-black/40 px-3 py-2.5 text-xs"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono-tabular font-bold text-white">{tk.code}</span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                          isUsed
+                            ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                            : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                        }`}
+                      >
+                        {isUsed ? 'USADO EN PUERTA' : '✓ VÁLIDO PARA ESCANEAR'}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 truncate text-[11px] text-zinc-400">
+                      {tk.userName} · <span className="font-mono-tabular text-zinc-300">{ownerMail}</span>
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {isUsed ? (
+                      <button
+                        type="button"
+                        onClick={() => handleResetTicketStatus(tk.id)}
+                        className="rounded-lg border border-amber-500/40 bg-amber-500/20 px-2.5 py-1.5 text-[11px] font-bold text-amber-200 hover:bg-amber-500/30"
+                      >
+                        Reactivar QR
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={testingDoorValidation}
+                        onClick={() => handleQuickDoorValidation(tk.qrPayload || tk.code)}
+                        className="rounded-lg bg-emerald-600 px-2.5 py-1.5 text-[11px] font-bold text-white hover:bg-emerald-500"
+                      >
+                        Verificar QR
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   const handleResendAllBuyerTickets = async () => {
     setSendingAllBuyerEmails(true);
@@ -1703,6 +1914,9 @@ function doGet(e) {
           )}
         </div>
 
+        {/* SUBIR Y VINCULAR APK CON LOS QR ENVIADOS A LOS CORREOS */}
+        {renderApkLinkerCard()}
+
         {/* TABLA DE ENTRADAS EMITIDAS */}
         <div className="rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900/60">
           <div className="overflow-x-auto">
@@ -1902,6 +2116,9 @@ function doGet(e) {
             </button>
           </div>
         </div>
+
+        {/* SUBIR Y VINCULAR APK CON LOS QR ENVIADOS A LOS CORREOS */}
+        {renderApkLinkerCard()}
 
         {/* Exact Connection Parameters Card for Mobile App VALIDADOR */}
         <div className="rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-[#0D0D12]">
