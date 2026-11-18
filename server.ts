@@ -4819,16 +4819,7 @@ async function startServer() {
       res.status(401).json({ error: 'Sesión expirada. Inicia sesión nuevamente en LV-Validador.' });
       return;
     }
-    const list: Array<{
-      id: string;
-      title: string;
-      date: string;
-      time: string;
-      location: string;
-      used: number;
-      total: number;
-      kind?: string;
-    }> = db.events
+    const list = db.events
       .filter((e) => e.status !== 'archived')
       .map((ev) => {
         const eventTickets = db.tickets.filter((t) => t.eventId === ev.id && t.status !== 'revoked');
@@ -4842,54 +4833,8 @@ async function startServer() {
           location: [ev.venue, ev.city].filter(Boolean).join(' · ') || 'Caracas',
           used,
           total,
-          kind: 'event',
         };
       });
-
-    if (String(req.query.onlyEvents || '') !== '1') {
-      const enrichedTickets = getEnrichedTicketsForApk();
-      const historyLogs = getEnrichedAccessHistoryForApk();
-
-      // Append each registered person / ticket holder so the validator sees all people & their QR status right on the screen
-      for (const tk of enrichedTickets) {
-        const statusBadge = tk.status === 'used' ? '✅ YA INGRESÓ' : '🎫 PASE VÁLIDO';
-        const usedTime = tk.usedAt
-          ? ` · Entró: ${new Date(tk.usedAt).toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit' })}`
-          : '';
-        list.push({
-          id: `person_${tk.id}`,
-          title: `👤 ${tk.userName} (${statusBadge})`,
-          date: `✉ ${tk.userEmail}${tk.userPhone ? ' · 📱 ' + tk.userPhone : ''}`,
-          time: `${tk.ticketType.toUpperCase()} (${tk.seatLabel})`,
-          location: `QR: ${tk.code} · Ref: ${tk.reference}${usedTime}`,
-          used: 0,
-          total: 0,
-          kind: 'person',
-        });
-      }
-
-      // Append chronological scan history so the validator sees the complete history of scans
-      for (const h of historyLogs.slice(0, 25)) {
-        const icon = h.color === 'green' ? '🟢 PERMITIDO' : h.color === 'yellow' ? '🟡 YA USADO' : '🔴 RECHAZADO';
-        const timeStr = new Date(h.timestamp).toLocaleString('es-VE', {
-          day: '2-digit',
-          month: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-        });
-        list.push({
-          id: `hist_${h.id}`,
-          title: `📋 HISTORIAL: ${icon} · ${h.holderName}`,
-          date: `🕒 ${timeStr}`,
-          time: `${h.ticketType.toUpperCase()} · ${h.ticketCode}`,
-          location: `${h.holderEmail ? '✉ ' + h.holderEmail + ' · ' : ''}Ref: ${h.reference} · Por: ${h.validatedBy}`,
-          used: 0,
-          total: 0,
-          kind: 'history',
-        });
-      }
-    }
 
     res.json(list);
   });
