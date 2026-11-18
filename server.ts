@@ -1670,7 +1670,10 @@ async function startServer() {
       req.path === '/api/me' ||
       req.path === '/api/admin/events' ||
       req.path === '/api/admin/validate' ||
+      req.path === '/api/admin/history' ||
+      req.path === '/api/admin/attendees' ||
       req.path === '/LK-Validador.apk' ||
+      req.path === '/LV-Validador.apk' ||
       req.path === '/api/scan' ||
       req.path === '/api/verify' ||
       req.path === '/api/validate' ||
@@ -4523,7 +4526,13 @@ async function startServer() {
       }
 
       const tk = check.ticket;
-      if (eventFilterId && tk.eventId !== eventFilterId) {
+      const isRealEventFilter =
+        Boolean(eventFilterId) &&
+        !eventFilterId.startsWith('person_') &&
+        !eventFilterId.startsWith('hist_') &&
+        !eventFilterId.startsWith('header_') &&
+        db.events.some((e) => e.id === eventFilterId);
+      if (isRealEventFilter && tk.eventId !== eventFilterId) {
         outcome = {
           allowed: false,
           ticket: tk,
@@ -4740,14 +4749,86 @@ async function startServer() {
   app.get('/api/lk-validador/events', handleValidatorEvents);
   app.get('/api/lb-validador/events', handleValidatorEvents);
 
+  // Sync all issued & emailed QR tickets with full Person Info + Payment Reference for APK LV-Validador
+  const getEnrichedTicketsForApk = () => {
+    const orderMap = new Map(db.orders.map((o) => [o.id, o]));
+    const userMap = new Map(db.users.map((u) => [u.id, u]));
+    return db.tickets.map((t) => {
+      const ord = orderMap.get(t.orderId);
+      const usr = userMap.get(t.userId);
+      const resolvedName =
+        t.userName || ord?.payerName || ord?.userName || usr?.name || 'Asistente Oficial';
+      const resolvedEmail =
+        (t as any).userEmail ||
+        ord?.payerEmail ||
+        ord?.userEmail ||
+        (usr && !usr.email.endsWith('.local') ? usr.email : 'forgen122@gmail.com');
+      const resolvedPhone = ord?.payerPhone || usr?.phone || '';
+      const resolvedReference = ord?.referenceNumber || t.orderId || t.code;
+      const resolvedPaymentMethod = ord?.paymentMethod
+        ? String(ord.paymentMethod).toUpperCase().replace(/_/g, ' ')
+        : 'CONFIRMADO';
+      const resolvedAmountUsd = ord?.totalUsd ?? 0;
+      const seat = (t as any).seatLabel || t.seatNumber || 'GEN-01';
+      return {
+        ...t,
+        userName: resolvedName,
+        userEmail: resolvedEmail,
+        userPhone: resolvedPhone,
+        reference: resolvedReference,
+        paymentMethod: resolvedPaymentMethod,
+        amountUsd: resolvedAmountUsd,
+        seatLabel: seat,
+      };
+    });
+  };
+
+  const getEnrichedAccessHistoryForApk = () => {
+    const enrichedTickets = getEnrichedTicketsForApk();
+    const ticketById = new Map(enrichedTickets.map((t) => [t.id, t]));
+    const ticketByCode = new Map(enrichedTickets.map((t) => [t.code.toUpperCase(), t]));
+    return db.accessLogs.slice(0, 120).map((log) => {
+      const tk =
+        ticketById.get(log.ticketId) ||
+        ticketByCode.get(String(log.ticketCode || '').toUpperCase());
+      const color: 'green' | 'yellow' | 'red' =
+        log.result === 'ENTRADA_VALIDA'
+          ? 'green'
+          : log.result === 'YA_UTILIZADA'
+            ? 'yellow'
+            : 'red';
+      return {
+        ...log,
+        color,
+        holderName: tk?.userName || log.holderName || 'Desconocido',
+        holderEmail: tk?.userEmail || '',
+        holderPhone: tk?.userPhone || '',
+        seatLabel: tk?.seatLabel || 'GEN-01',
+        reference: tk?.reference || log.ticketCode || '',
+        paymentMethod: tk?.paymentMethod || '',
+        amountUsd: tk?.amountUsd ?? 0,
+      };
+    });
+  };
+
   // Exact array response required by LV-Validador.apk (GET /api/admin/events)
+  // Includes real events + live Person Directory & Scan History cards (with used:0, total:0 so top counters remain exact)
   app.get('/api/admin/events', (req: AuthedRequest, res: Response) => {
     const hasStaffPerm = req.user && getEffectivePermissions(req.user).includes('validator');
     if (!hasStaffPerm && !req.user) {
       res.status(401).json({ error: 'Sesión expirada. Inicia sesión nuevamente en LV-Validador.' });
       return;
     }
-    const list = db.events
+    const list: Array<{
+      id: string;
+      title: string;
+      date: string;
+      time: string;
+      location: string;
+      used: number;
+      total: number;
+      kind?: string;
+    }> = db.events
       .filter((e) => e.status !== 'archived')
       .map((ev) => {
         const eventTickets = db.tickets.filter((t) => t.eventId === ev.id && t.status !== 'revoked');
@@ -4761,29 +4842,75 @@ async function startServer() {
           location: [ev.venue, ev.city].filter(Boolean).join(' · ') || 'Caracas',
           used,
           total,
+          kind: 'event',
         };
       });
+
+    if (String(req.query.onlyEvents || '') !== '1') {
+      const enrichedTickets = getEnrichedTicketsForApk();
+      const historyLogs = getEnrichedAccessHistoryForApk();
+
+      // Append each registered person / ticket holder so the validator sees all people & their QR status right on the screen
+      for (const tk of enrichedTickets) {
+        const statusBadge = tk.status === 'used' ? '✅ YA INGRESÓ' : '🎫 PASE VÁLIDO';
+        const usedTime = tk.usedAt
+          ? ` · Entró: ${new Date(tk.usedAt).toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit' })}`
+          : '';
+        list.push({
+          id: `person_${tk.id}`,
+          title: `👤 ${tk.userName} (${statusBadge})`,
+          date: `✉ ${tk.userEmail}${tk.userPhone ? ' · 📱 ' + tk.userPhone : ''}`,
+          time: `${tk.ticketType.toUpperCase()} (${tk.seatLabel})`,
+          location: `QR: ${tk.code} · Ref: ${tk.reference}${usedTime}`,
+          used: 0,
+          total: 0,
+          kind: 'person',
+        });
+      }
+
+      // Append chronological scan history so the validator sees the complete history of scans
+      for (const h of historyLogs.slice(0, 25)) {
+        const icon = h.color === 'green' ? '🟢 PERMITIDO' : h.color === 'yellow' ? '🟡 YA USADO' : '🔴 RECHAZADO';
+        const timeStr = new Date(h.timestamp).toLocaleString('es-VE', {
+          day: '2-digit',
+          month: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        });
+        list.push({
+          id: `hist_${h.id}`,
+          title: `📋 HISTORIAL: ${icon} · ${h.holderName}`,
+          date: `🕒 ${timeStr}`,
+          time: `${h.ticketType.toUpperCase()} · ${h.ticketCode}`,
+          location: `${h.holderEmail ? '✉ ' + h.holderEmail + ' · ' : ''}Ref: ${h.reference} · Por: ${h.validatedBy}`,
+          used: 0,
+          total: 0,
+          kind: 'history',
+        });
+      }
+    }
+
     res.json(list);
   });
 
-  // Sync all issued & emailed QR tickets with APK LK-VALIDADOR
-  const getEnrichedTicketsForApk = () => {
-    const orderMap = new Map(db.orders.map((o) => [o.id, o]));
-    const userMap = new Map(db.users.map((u) => [u.id, u]));
-    return db.tickets.map((t) => {
-      const ord = orderMap.get(t.orderId);
-      const usr = userMap.get(t.userId);
-      const resolvedEmail =
-        (t as any).userEmail ||
-        ord?.payerEmail ||
-        ord?.userEmail ||
-        (usr && !usr.email.endsWith('.local') ? usr.email : 'forgen122@gmail.com');
-      return {
-        ...t,
-        userEmail: resolvedEmail,
-      };
+  // Dedicated History & Attendees endpoints for LV-Validador APK v2.0
+  const handleAdminHistoryAndAttendees = (_req: AuthedRequest, res: Response) => {
+    const attendees = getEnrichedTicketsForApk();
+    const history = getEnrichedAccessHistoryForApk();
+    res.json({
+      ok: true,
+      totalTickets: attendees.length,
+      usedTickets: attendees.filter((t) => t.status === 'used').length,
+      validTickets: attendees.filter((t) => t.status === 'valid').length,
+      attendees,
+      history,
     });
   };
+  app.get('/api/admin/history', handleAdminHistoryAndAttendees);
+  app.get('/api/admin/attendees', handleAdminHistoryAndAttendees);
+  app.get('/api/validator/history', handleAdminHistoryAndAttendees);
+  app.get('/api/lk-validador/history', handleAdminHistoryAndAttendees);
 
   const handleValidatorTickets = (_req: AuthedRequest, res: Response) => {
     const tickets = getEnrichedTicketsForApk();
@@ -4794,6 +4921,7 @@ async function startServer() {
       validCount: tickets.filter((t) => t.status === 'valid').length,
       usedCount: tickets.filter((t) => t.status === 'used').length,
       tickets,
+      history: getEnrichedAccessHistoryForApk(),
     });
   };
   app.get('/api/validator/tickets', handleValidatorTickets);
@@ -4871,6 +4999,7 @@ async function startServer() {
             '/api/me',
             '/api/admin/events',
             '/api/admin/validate',
+            '/api/admin/history',
           ];
 
     return {
@@ -4880,9 +5009,9 @@ async function startServer() {
       sha256: sha256.slice(0, 16).toUpperCase(),
       isValidApkPackage: isZipApk,
       detectedEndpoints,
-      hmacProtocol: 'LV-XXXX-1-XXXXXXXX · HMAC-SHA256 Base32 (Sin 0/1)',
+      hmacProtocol: 'LV-XXXX-1-XXXXXXXX · HMAC-SHA256 Base32 (Sin 0/1) + Ficha de Persona e Historial',
       linkedAt: new Date().toISOString(),
-      downloadPath: '/LK-Validador.apk',
+      downloadPath: '/LV-Validador.apk',
     };
   }
 
@@ -4896,7 +5025,7 @@ async function startServer() {
     async (req: AuthedRequest, res: Response) => {
       try {
         let apkBuffer: Buffer | null = null;
-        let fileName = String(req.headers['x-apk-filename'] || req.query.filename || 'LK-Validador.apk').trim();
+        let fileName = String(req.headers['x-apk-filename'] || req.query.filename || 'LV-Validador.apk').trim();
 
         if (Buffer.isBuffer(req.body) && req.body.length > 0) {
           apkBuffer = req.body;
@@ -4942,32 +5071,50 @@ async function startServer() {
     '/api/admin/apk/status',
     requirePermission('validator', 'tickets_qr', 'orders_payments', 'settings'),
     (_req: AuthedRequest, res: Response) => {
+      const bundledApkPath = path.join(process.cwd(), 'public', 'LV-Validador.apk');
+      if (!fs.existsSync(APK_FILE_PATH) && fs.existsSync(bundledApkPath)) {
+        try {
+          const buf = fs.readFileSync(bundledApkPath);
+          fs.writeFileSync(APK_FILE_PATH, buf);
+          (db.settings as any).linkedApk = inspectApkBuffer(buf, 'LV-Validador.apk');
+        } catch {
+          // ignore
+        }
+      }
       const tickets = getEnrichedTicketsForApk();
       res.json({
         ok: true,
         linkedApk: (db.settings as any)?.linkedApk || null,
-        apkFileHosted: fs.existsSync(APK_FILE_PATH),
+        apkFileHosted: fs.existsSync(APK_FILE_PATH) || fs.existsSync(bundledApkPath),
         syncedTicketsCount: tickets.length,
         validTicketsCount: tickets.filter((t) => t.status === 'valid').length,
         tickets: tickets.slice(0, 50),
+        history: getEnrichedAccessHistoryForApk().slice(0, 30),
       });
     }
   );
 
   const handleDownloadApk = (_req: Request, res: Response) => {
-    if (!fs.existsSync(APK_FILE_PATH)) {
-      res.status(404).json({ error: 'Aún no se ha subido el archivo LK-Validador.apk al servidor.' });
+    const bundledApkPath = path.join(process.cwd(), 'public', 'LV-Validador.apk');
+    const targetPath = fs.existsSync(APK_FILE_PATH)
+      ? APK_FILE_PATH
+      : fs.existsSync(bundledApkPath)
+        ? bundledApkPath
+        : '';
+    if (!targetPath) {
+      res.status(404).json({ error: 'Aún no se ha subido el archivo LV-Validador.apk al servidor.' });
       return;
     }
-    const fileName = String((db.settings as any)?.linkedApk?.fileName || 'LK-Validador.apk').replace(
+    const fileName = String((db.settings as any)?.linkedApk?.fileName || 'LV-Validador.apk').replace(
       /[^a-zA-Z0-9._-]/g,
       '_'
     );
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    res.sendFile(APK_FILE_PATH);
+    res.sendFile(targetPath);
   };
   app.get('/LK-Validador.apk', handleDownloadApk);
+  app.get('/LV-Validador.apk', handleDownloadApk);
   app.get('/api/validador/apk', handleDownloadApk);
   app.get('/api/lk-validador/apk', handleDownloadApk);
 
@@ -5022,7 +5169,30 @@ async function startServer() {
     const result = await executeAtomicScan(rawCode, eventFilterId, operator, req.user);
     const tk = result.ticket;
     const parentOrder = tk ? db.orders.find((o) => o.id === tk.orderId) : undefined;
+    const ownerUser = tk ? db.users.find((u) => u.id === tk.userId) : undefined;
     const logCode = result.log?.result || '';
+
+    const personName =
+      tk?.userName ||
+      parentOrder?.payerName ||
+      parentOrder?.userName ||
+      ownerUser?.name ||
+      (result.log?.holderName !== '—' ? result.log?.holderName : 'Desconocido');
+    const personEmail =
+      (tk as any)?.userEmail ||
+      parentOrder?.payerEmail ||
+      parentOrder?.userEmail ||
+      (ownerUser && !ownerUser.email.endsWith('.local') ? ownerUser.email : 'forgen122@gmail.com');
+    const personPhone = parentOrder?.payerPhone || ownerUser?.phone || '';
+    const seatLabel = (tk as any)?.seatLabel || tk?.seatNumber || 'GEN-01';
+    const paymentRef = parentOrder?.referenceNumber || tk?.orderId || tk?.code || '';
+    const paymentMethod = parentOrder?.paymentMethod
+      ? String(parentOrder.paymentMethod).toUpperCase().replace(/_/g, ' ')
+      : 'CONFIRMADO';
+    const amountUsd = parentOrder?.totalUsd !== undefined ? `$${Number(parentOrder.totalUsd).toFixed(2)} USD` : '';
+    const ticketLogs = tk
+      ? db.accessLogs.filter((l) => l.ticketId === tk.id || l.ticketCode === tk.code).slice(0, 10)
+      : [];
 
     let color: 'green' | 'yellow' | 'red' = 'red';
     let apkBannerResult = 'PASE NO VÁLIDO';
@@ -5040,6 +5210,16 @@ async function startServer() {
       apkBannerResult = 'FIRMA INVÁLIDA';
     }
 
+    const holderSummary = tk
+      ? `👤 ${personName} · ✉ ${personEmail}${personPhone ? ' · 📱 ' + personPhone : ''}`
+      : personName;
+    const passSummary = tk
+      ? `${tk.ticketType.toUpperCase()} · Asiento ${seatLabel} · QR: ${tk.code}`
+      : '';
+    const refSummary = tk
+      ? `${paymentRef} · ${paymentMethod}${amountUsd ? ' (' + amountUsd + ')' : ''} · Escaneos: ${ticketLogs.length}`
+      : paymentRef;
+
     res.json({
       ...result,
       ok: result.allowed,
@@ -5053,10 +5233,29 @@ async function startServer() {
       message: result.log?.message,
       mensaje: result.log?.message,
       event: tk?.eventTitle || (result.log?.eventTitle !== 'Desconocido' ? result.log?.eventTitle : ''),
-      holder: tk?.userName || (result.log?.holderName !== '—' ? result.log?.holderName : ''),
-      pass: tk ? `${tk.ticketType.toUpperCase()} (${tk.seatNumber || tk.code})` : '',
-      reference: parentOrder?.referenceNumber || tk?.orderId || tk?.code || '',
+      holder: holderSummary,
+      pass: passSummary,
+      reference: refSummary,
       usedAt: logCode === 'YA_UTILIZADA' ? result.previousUsedAt || tk?.usedAt : undefined,
+      person: tk
+        ? {
+            name: personName,
+            email: personEmail,
+            phone: personPhone || 'No registrado',
+            ticketCode: tk.code,
+            ticketType: tk.ticketType.toUpperCase(),
+            seat: seatLabel,
+            orderId: tk.orderId,
+            reference: paymentRef,
+            paymentMethod,
+            amountUsd: parentOrder?.totalUsd ?? 0,
+            status: tk.status,
+            usedAt: result.previousUsedAt || tk.usedAt || null,
+            validatedBy: tk.validatedBy || operator,
+            scanCount: ticketLogs.length,
+            history: ticketLogs,
+          }
+        : null,
     });
   };
 
