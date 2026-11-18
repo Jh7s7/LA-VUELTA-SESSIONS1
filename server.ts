@@ -2191,7 +2191,19 @@ async function startServer() {
         ? db.orders
         : [],
       tickets: perms.some((p) => ['overview', 'tickets_qr', 'orders_payments'].includes(p))
-        ? db.tickets
+        ? db.tickets.map((tk) => {
+            const ord = db.orders.find((o) => o.id === tk.orderId);
+            const usr = db.users.find((u) => u.id === tk.userId);
+            return {
+              ...tk,
+              userEmail:
+                (tk as any).userEmail ||
+                ord?.payerEmail ||
+                ord?.userEmail ||
+                usr?.email ||
+                '',
+            };
+          })
         : [],
       accessLogs: perms.some((p) => ['validator', 'overview'].includes(p))
         ? db.accessLogs
@@ -4146,12 +4158,26 @@ async function startServer() {
       }
 
       const parentOrder = db.orders.find((o) => o.id === ticket!.orderId);
-      const defaultRecipient =
-        email ||
+      const ownerUser = db.users.find((u) => u.id === ticket!.userId);
+      const registeredBuyerEmail =
+        (ticket as any).userEmail ||
         parentOrder?.payerEmail ||
         parentOrder?.userEmail ||
-        req.user?.email ||
-        'forgen122@gmail.com';
+        (ownerUser && !ownerUser.email.endsWith('.local') ? ownerUser.email : '');
+
+      // If a real buyer ticket is selected and no custom override was forced, prefer the buyer's registered email
+      const cleanOverride = String(email || '').trim().toLowerCase();
+      const isDefaultAdminPlaceholder =
+        !cleanOverride ||
+        (registeredBuyerEmail &&
+          !String(ticket.orderId || '').startsWith('ORD-DEMO-') &&
+          cleanOverride === 'forgen122@gmail.com' &&
+          req.body?.useBuyerEmail !== false);
+
+      const defaultRecipient = isDefaultAdminPlaceholder
+        ? registeredBuyerEmail || cleanOverride || req.user?.email || 'forgen122@gmail.com'
+        : cleanOverride || registeredBuyerEmail || req.user?.email || 'forgen122@gmail.com';
+
       const recipientEmail = String(defaultRecipient).trim().toLowerCase();
       const appUrl = `${(req.headers['x-forwarded-proto'] as string) || req.protocol}://${req.headers.host}`;
       const orderTickets = ticket.orderId ? db.tickets.filter((t) => t.orderId === ticket!.orderId) : [ticket];
@@ -4174,6 +4200,58 @@ async function startServer() {
       void persistDb();
 
       res.json(result);
+    }
+  );
+
+  // Enviar entradas QR a todos los correos de compradores con órdenes aprobadas en 1 clic
+  app.post(
+    '/api/admin/tickets/resend-all',
+    requirePermission('tickets_qr', 'orders_payments'),
+    async (req: AuthedRequest, res: Response) => {
+      if (req.body?.emailConfig) {
+        applyAutoDetectedEmailConfig(req.body.emailConfig);
+      }
+      const appUrl = `${(req.headers['x-forwarded-proto'] as string) || req.protocol}://${req.headers.host}`;
+      const approvedOrders = db.orders.filter(
+        (o) => o.status === 'approved' && !String(o.id || '').startsWith('ORD-DEMO-')
+      );
+      const results: { orderId: string; recipient: string; sent: boolean; note: string }[] = [];
+
+      for (const ord of approvedOrders) {
+        const usr = db.users.find((u) => u.id === ord.userId);
+        const buyerEmail = String(ord.payerEmail || ord.userEmail || usr?.email || '')
+          .trim()
+          .toLowerCase();
+        if (!buyerEmail || buyerEmail.endsWith('.local')) continue;
+
+        let ordTickets = db.tickets.filter((t) => t.orderId === ord.id);
+        if (ordTickets.length === 0) {
+          ordTickets = issueTicketsForOrder(ord);
+        }
+        if (ordTickets.length === 0) continue;
+
+        const dispatchRes = await dispatchTicketEmailOrSimulate({
+          ticket: ordTickets[0],
+          allTickets: ordTickets,
+          recipientEmail: buyerEmail,
+          appUrl,
+          triggeredBy: req.user!.email,
+        });
+        results.push({
+          orderId: ord.id,
+          recipient: buyerEmail,
+          sent: Boolean(dispatchRes.sentRealSmtp),
+          note: dispatchRes.providerNote,
+        });
+      }
+
+      void persistDb();
+      res.json({
+        ok: true,
+        totalDispatched: results.length,
+        sentCount: results.filter((r) => r.sent).length,
+        results,
+      });
     }
   );
 

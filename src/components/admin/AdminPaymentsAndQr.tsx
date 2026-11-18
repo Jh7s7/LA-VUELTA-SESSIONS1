@@ -371,22 +371,94 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     })();
   }, []);
 
+  const getTicketOwnerEmail = (tk?: TicketRecord | null): string => {
+    if (!tk) return '';
+    const direct = String((tk as any).userEmail || '').trim();
+    if (direct && !direct.endsWith('.local')) return direct;
+    const ord = orders.find((o) => o.id === tk.orderId);
+    if (ord?.payerEmail && !ord.payerEmail.endsWith('.local')) return ord.payerEmail.trim();
+    if (ord?.userEmail && !ord.userEmail.endsWith('.local')) return ord.userEmail.trim();
+    return '';
+  };
+
+  const registeredBuyerEmails = Array.from(
+    new Set(
+      [
+        ...orders.map((o) => (o.payerEmail || o.userEmail || '').trim().toLowerCase()),
+        ...tickets.map((t) => getTicketOwnerEmail(t).toLowerCase()),
+        'forgen122@gmail.com',
+      ].filter((e) => e && e.includes('@') && !e.endsWith('.local'))
+    )
+  );
+
+  const [sendingAllBuyerEmails, setSendingAllBuyerEmails] = useState(false);
+
+  const handleResendAllBuyerTickets = async () => {
+    setSendingAllBuyerEmails(true);
+    try {
+      const resp = await apiRequest<{
+        ok: boolean;
+        totalDispatched: number;
+        sentCount: number;
+        results: { orderId: string; recipient: string; sent: boolean; note: string }[];
+      }>('POST', '/api/admin/tickets/resend-all', {
+        emailConfig: getStoredEmailConfig(),
+      });
+      if (resp.sentCount > 0) {
+        onNotify(
+          `¡Enviados ${resp.sentCount} pases QR a los correos registrados (${resp.results.map((r) => r.recipient).join(', ')})!`,
+          'success'
+        );
+      } else if (resp.totalDispatched > 0) {
+        onNotify(
+          `Se procesaron ${resp.totalDispatched} órdenes (${resp.results[0]?.note || 'Revisa acceso Cualquier persona en Google Script'}).`,
+          'info'
+        );
+      } else {
+        onNotify('No hay órdenes aprobadas de compradores pendientes por enviar.', 'info');
+      }
+      void onRefresh();
+    } catch (err: any) {
+      onNotify(err.message || 'Error al enviar entradas a los compradores.', 'error');
+    } finally {
+      setSendingAllBuyerEmails(false);
+    }
+  };
+
   const handleSendTicketEmail = async (
     overrideTicketId?: string,
     overrideOrderId?: string,
     overrideEmail?: string
   ) => {
     const targetTicketId = overrideTicketId || selectedTestTicketId;
-    const recipientTarget = (overrideEmail || testEmailTarget || 'forgen122@gmail.com').trim();
-    setSendingTestEmail(true);
-    setDoorTestFeedback(null);
-
-    // Instant 0ms optimistic preview if ticket is already loaded in memory
-    const optimisticTicket = tickets.find(
+    const matchedTicket = tickets.find(
       (t) =>
         (targetTicketId && t.id === targetTicketId) ||
         (overrideOrderId && t.orderId === overrideOrderId)
     );
+    const matchedOrder = overrideOrderId ? orders.find((o) => o.id === overrideOrderId) : undefined;
+    const ownerEmail =
+      getTicketOwnerEmail(matchedTicket) ||
+      matchedOrder?.payerEmail ||
+      matchedOrder?.userEmail ||
+      '';
+
+    const recipientTarget = (
+      overrideEmail ||
+      (overrideTicketId || overrideOrderId ? ownerEmail : '') ||
+      testEmailTarget ||
+      ownerEmail ||
+      'forgen122@gmail.com'
+    ).trim();
+
+    if (recipientTarget) {
+      setTestEmailTarget(recipientTarget);
+    }
+    setSendingTestEmail(true);
+    setDoorTestFeedback(null);
+
+    // Instant 0ms optimistic preview if ticket is already loaded in memory
+    const optimisticTicket = matchedTicket;
     if (optimisticTicket) {
       setEmailTestResult((prev) => ({
         ok: true,
@@ -423,6 +495,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         ticketId: targetTicketId || undefined,
         orderId: overrideOrderId || undefined,
         email: recipientTarget,
+        useBuyerEmail: Boolean(overrideTicketId || overrideOrderId),
         createDemoIfMissing: !targetTicketId && !overrideOrderId,
         emailConfig: getStoredEmailConfig(),
       });
@@ -440,7 +513,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
       } else {
         setShowEmailConfigBox(true);
         onNotify(
-          `Pase QR ${resp.ticketCode} generado en pantalla. Activa el Puente Gmail HTTPS para que llegue a la bandeja de ${resp.recipient}.`,
+          `Pase QR ${resp.ticketCode} listo para ${resp.recipient}. ${resp.providerNote || ''}`,
           'info'
         );
       }
@@ -1295,6 +1368,19 @@ function doGet(e) {
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
+                disabled={sendingAllBuyerEmails}
+                onClick={() => handleResendAllBuyerTickets()}
+                className="inline-flex items-center gap-1.5 rounded-full bg-[#E50914] px-3 py-1 text-[11px] font-bold text-white hover:bg-[#c80812] disabled:opacity-50"
+              >
+                <Send className="h-3 w-3" />
+                <span>
+                  {sendingAllBuyerEmails
+                    ? 'Enviando a Compradores...'
+                    : 'Enviar QR a Todos los Compradores Aprobados'}
+                </span>
+              </button>
+              <button
+                type="button"
                 onClick={() => setShowEmailConfigBox((v) => !v)}
                 className="inline-flex items-center gap-1.5 rounded-full border border-zinc-300 bg-zinc-100 px-3 py-1 text-[11px] font-semibold text-zinc-700 hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
               >
@@ -1386,20 +1472,42 @@ function doGet(e) {
           <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-12">
             <div className="md:col-span-5">
               <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1.5">
-                Correo Electrónico de Destino (Prueba)
+                Correo Electrónico de Destino (Comprador Registrado o Prueba)
               </label>
               <div className="relative">
                 <input
                   type="email"
+                  list="registered-buyer-emails"
                   value={testEmailTarget}
                   onChange={(e) => setTestEmailTarget(e.target.value)}
-                  placeholder="forgen122@gmail.com"
+                  placeholder="Correo del comprador o forgen122@gmail.com"
                   className="w-full rounded-xl border border-zinc-300 bg-zinc-50 px-3.5 py-2.5 text-xs text-zinc-900 focus:border-[#E50914] focus:outline-none dark:border-zinc-700 dark:bg-black/50 dark:text-white"
                 />
+                <datalist id="registered-buyer-emails">
+                  {registeredBuyerEmails.map((em) => (
+                    <option key={em} value={em} />
+                  ))}
+                </datalist>
               </div>
-              <span className="mt-1 block text-[11px] text-zinc-500">
-                Dirección a la cual se despachará o simulará el ticket digital.
-              </span>
+              {registeredBuyerEmails.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                  <span className="text-[10px] text-zinc-500">Correos registrados:</span>
+                  {registeredBuyerEmails.slice(0, 6).map((em) => (
+                    <button
+                      key={em}
+                      type="button"
+                      onClick={() => setTestEmailTarget(em)}
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                        testEmailTarget.toLowerCase() === em
+                          ? 'bg-[#E50914] text-white'
+                          : 'bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300'
+                      }`}
+                    >
+                      {em}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="md:col-span-4">
@@ -1408,20 +1516,31 @@ function doGet(e) {
               </label>
               <select
                 value={selectedTestTicketId}
-                onChange={(e) => setSelectedTestTicketId(e.target.value)}
+                onChange={(e) => {
+                  const nextId = e.target.value;
+                  setSelectedTestTicketId(nextId);
+                  if (nextId) {
+                    const chosen = tickets.find((tk) => tk.id === nextId);
+                    const ownerEm = getTicketOwnerEmail(chosen);
+                    if (ownerEm) {
+                      setTestEmailTarget(ownerEm);
+                    }
+                  }
+                }}
                 className="w-full rounded-xl border border-zinc-300 bg-zinc-50 px-3.5 py-2.5 text-xs text-zinc-900 focus:border-[#E50914] focus:outline-none dark:border-zinc-700 dark:bg-black/50 dark:text-white"
               >
                 <option value="">(Generar Entrada Demo Oficial Automática)</option>
-                {tickets.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.code} · {t.userName} ({t.ticketType.toUpperCase()})
-                  </option>
-                ))}
+                {tickets.map((t) => {
+                  const ownerEm = getTicketOwnerEmail(t);
+                  return (
+                    <option key={t.id} value={t.id}>
+                      {t.code} · {t.userName} ({ownerEm || t.ticketType.toUpperCase()})
+                    </option>
+                  );
+                })}
               </select>
               <span className="mt-1 block text-[11px] text-zinc-500">
-                {tickets.length > 0
-                  ? `${tickets.length} entradas emitidas disponibles.`
-                  : 'Se creará un pase demo si no hay entradas.'}
+                Al elegir un pase, se selecciona automáticamente el correo de su comprador.
               </span>
             </div>
 
@@ -1455,7 +1574,7 @@ function doGet(e) {
                   <CheckCircle2 className="h-4 w-4 text-emerald-500" />
                   <span className="text-xs font-bold text-zinc-900 dark:text-white">
                     {emailTestResult.sentRealSmtp
-                      ? 'Ticket Enviado vía SMTP'
+                      ? 'Ticket Enviado vía Gmail HTTPS'
                       : 'Simulación de Ticket Lista para Escaneo con APK'}
                   </span>
                   <span className="rounded bg-zinc-200 px-2 py-0.5 text-[10px] font-mono font-semibold dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300">
@@ -1592,7 +1711,7 @@ function doGet(e) {
                 <tr>
                   <th className="px-4 py-3 font-medium">Código Ticket</th>
                   <th className="px-4 py-3 font-medium">Evento</th>
-                  <th className="px-4 py-3 font-medium">Titular</th>
+                  <th className="px-4 py-3 font-medium">Titular · Correo Registrado</th>
                   <th className="px-4 py-3 font-medium">Categoría</th>
                   <th className="px-4 py-3 font-medium">Estado</th>
                   <th className="px-4 py-3 text-right font-medium">Acciones</th>
@@ -1606,71 +1725,79 @@ function doGet(e) {
                     </td>
                   </tr>
                 ) : (
-                  filteredTickets.map((t) => (
-                    <tr key={t.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/40">
-                      <td className="px-4 py-3 font-mono-tabular text-xs font-semibold">
-                        {t.code}
-                      </td>
-                      <td className="px-4 py-3 text-xs">{t.eventTitle}</td>
-                      <td className="px-4 py-3 text-xs">{t.userName}</td>
-                      <td className="px-4 py-3 text-xs">
-                        <span className="uppercase font-semibold">
-                          {t.ticketType === 'vip' ? 'OFICIAL' : t.ticketType.toUpperCase()}
-                        </span>
-                        {t.seatLabel && (
-                          <span className="ml-1.5 font-mono-tabular text-zinc-500">
-                            · {formatSeatDisplay(t.seatLabel).replace('VIP-', 'GEN-')}
+                  filteredTickets.map((t) => {
+                    const buyerEmail = getTicketOwnerEmail(t);
+                    return (
+                      <tr key={t.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/40">
+                        <td className="px-4 py-3 font-mono-tabular text-xs font-semibold">
+                          {t.code}
+                        </td>
+                        <td className="px-4 py-3 text-xs">{t.eventTitle}</td>
+                        <td className="px-4 py-3 text-xs">
+                          <div className="font-medium text-zinc-900 dark:text-white">{t.userName}</div>
+                          {buyerEmail && (
+                            <div className="text-[11px] text-zinc-500">{buyerEmail}</div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs">
+                          <span className="uppercase font-semibold">
+                            {t.ticketType === 'vip' ? 'OFICIAL' : t.ticketType.toUpperCase()}
                           </span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-xs">
-                        {t.status === 'valid' ? (
-                          <span className="inline-flex items-center gap-1 rounded bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
-                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                            Válido (sin usar)
-                          </span>
-                        ) : t.status === 'used' ? (
-                          <span className="inline-flex items-center gap-1 rounded bg-zinc-200 px-2 py-0.5 text-[11px] font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-400">
-                            Usado ({t.validatedBy || 'Puerta'})
-                          </span>
-                        ) : (
-                          t.status
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <div className="flex items-center justify-end gap-2.5">
-                          {t.status === 'used' && (
+                          {t.seatLabel && (
+                            <span className="ml-1.5 font-mono-tabular text-zinc-500">
+                              · {formatSeatDisplay(t.seatLabel).replace('VIP-', 'GEN-')}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs">
+                          {t.status === 'valid' ? (
+                            <span className="inline-flex items-center gap-1 rounded bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                              Válido (sin usar)
+                            </span>
+                          ) : t.status === 'used' ? (
+                            <span className="inline-flex items-center gap-1 rounded bg-zinc-200 px-2 py-0.5 text-[11px] font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-400">
+                              Usado ({t.validatedBy || 'Puerta'})
+                            </span>
+                          ) : (
+                            t.status
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <div className="flex items-center justify-end gap-2.5">
+                            {t.status === 'used' && (
+                              <button
+                                type="button"
+                                onClick={() => handleResetTicketStatus(t.id)}
+                                className="inline-flex items-center gap-1 text-xs font-semibold text-amber-600 hover:text-amber-700 dark:text-amber-400"
+                                title="Restablecer a Válido (sin usar) para volver a probar con la APK"
+                              >
+                                <RotateCcw className="h-3.5 w-3.5" />
+                                <span>Reactivar</span>
+                              </button>
+                            )}
                             <button
                               type="button"
-                              onClick={() => handleResetTicketStatus(t.id)}
-                              className="inline-flex items-center gap-1 text-xs font-semibold text-amber-600 hover:text-amber-700 dark:text-amber-400"
-                              title="Restablecer a Válido (sin usar) para volver a probar con la APK"
+                              onClick={() => handleSendTicketEmail(t.id, undefined, buyerEmail)}
+                              className="inline-flex items-center gap-1 text-xs font-semibold text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white"
+                              title={buyerEmail ? `Enviar a ${buyerEmail}` : 'Enviar a correo'}
                             >
-                              <RotateCcw className="h-3.5 w-3.5" />
-                              <span>Reactivar</span>
+                              <Mail className="h-3.5 w-3.5 text-[#E50914]" />
+                              <span>Enviar{buyerEmail ? ` a ${buyerEmail.split('@')[0]}` : ''}</span>
                             </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleSendTicketEmail(t.id)}
-                            className="inline-flex items-center gap-1 text-xs font-semibold text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white"
-                            title="Simular o reenviar a correo"
-                          >
-                            <Mail className="h-3.5 w-3.5 text-[#E50914]" />
-                            <span>Enviar</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setSelectedTicketQr(t)}
-                            className="inline-flex items-center gap-1 text-xs font-semibold text-[#E50914] hover:underline"
-                          >
-                            <QrCode className="h-3.5 w-3.5" />
-                            <span>Ver QR</span>
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))
+                            <button
+                              type="button"
+                              onClick={() => setSelectedTicketQr(t)}
+                              className="inline-flex items-center gap-1 text-xs font-semibold text-[#E50914] hover:underline"
+                            >
+                              <QrCode className="h-3.5 w-3.5" />
+                              <span>Ver QR</span>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
