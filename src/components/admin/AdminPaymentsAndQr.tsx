@@ -349,13 +349,19 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
         }>('GET', '/api/admin/email-config');
         if (status.configured) {
           setEmailServerConfigured(true);
-        } else if (Object.keys(saved).length > 0) {
+        } else if (Object.keys(saved).length > 0 && (saved.gmailWebhookUrl || saved.brevoApiKey || saved.resendApiKey)) {
           const restored = await apiRequest<{ ok: boolean; configured: boolean }>(
             'POST',
             '/api/admin/email-config',
             saved
           );
-          if (restored.configured) setEmailServerConfigured(true);
+          if (restored.configured) {
+            setEmailServerConfigured(true);
+          } else {
+            setShowEmailConfigBox(true);
+          }
+        } else {
+          setShowEmailConfigBox(true);
         }
       } catch {
         // ignore if user lacks admin_email_config permission
@@ -430,9 +436,10 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
           'success'
         );
       } else {
+        setShowEmailConfigBox(true);
         onNotify(
-          `Pase QR ${resp.ticketCode} generado al instante para ${resp.recipient}.`,
-          'success'
+          `Pase QR ${resp.ticketCode} generado en pantalla. Activa el Puente Gmail HTTPS para que llegue a la bandeja de ${resp.recipient}.`,
+          'info'
         );
       }
 
@@ -445,25 +452,45 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
 
   const GOOGLE_APPS_SCRIPT_SNIPPET = `function doPost(e) {
   try {
+    if (!e || !e.postData || !e.postData.contents) {
+      var myEmail = Session.getActiveUser().getEmail();
+      if (myEmail) {
+        MailApp.sendEmail({
+          to: myEmail,
+          subject: "✅ Puente Gmail LA VUELTA SESSIONS Activado",
+          htmlBody: "<div style='font-family:sans-serif;padding:20px;background:#0a0a0f;color:#fff;border-radius:12px'><h2 style='color:#E50914'>LA VUELTA SESSIONS</h2><p>Tu cuenta Gmail ya está autorizada para enviar entradas QR automáticamente desde Render.</p></div>",
+          name: "LA VUELTA SESSIONS"
+        });
+      }
+      return ContentService.createTextOutput(JSON.stringify({ ok: true, status: "authorized" })).setMimeType(ContentService.MimeType.JSON);
+    }
     var data = JSON.parse(e.postData.contents);
     var blobs = [];
+    var inlineImages = {};
     if (data.attachments && data.attachments.length) {
       for (var i = 0; i < data.attachments.length; i++) {
         var att = data.attachments[i];
-        blobs.push(Utilities.newBlob(Utilities.base64Decode(att.content), 'image/png', att.filename || ('Pase-QR-' + i + '.png')));
+        var blob = Utilities.newBlob(Utilities.base64Decode(att.content), "image/png", att.filename || ("Pase-QR-" + i + ".png"));
+        blobs.push(blob);
+        inlineImages["qr_" + i] = blob;
       }
     }
+    var bodyHtml = (data.cidHtmlBody && blobs.length > 0) ? data.cidHtmlBody : data.htmlBody;
     MailApp.sendEmail({
       to: data.to,
       subject: data.subject,
-      htmlBody: data.htmlBody,
-      name: 'LA VUELTA SESSIONS',
-      attachments: blobs
+      htmlBody: bodyHtml,
+      name: "LA VUELTA SESSIONS",
+      attachments: blobs,
+      inlineImages: inlineImages
     });
     return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
   } catch (err) {
     return ContentService.createTextOutput(JSON.stringify({ ok: false, error: String(err) })).setMimeType(ContentService.MimeType.JSON);
   }
+}
+function doGet(e) {
+  return doPost(e);
 }`;
 
   const handleConnectGoogleGmailScope = async (resendAfterConnect = false) => {
@@ -509,8 +536,9 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
   const handleSaveEmailConfig = async (resendTicketAfterSave?: boolean) => {
     setSavingEmailConfig(true);
     try {
+      const cleanVal = (gmailWebhookInput || smartKeyInput || resendKeyInput || brevoKeyInput || '').trim();
       const payload = {
-        smartKey: smartKeyInput.trim() || undefined,
+        smartKey: cleanVal || undefined,
         gmailWebhookUrl: gmailWebhookInput.trim() || undefined,
         gmailUser: gmailUserInput.trim() || undefined,
         gmailAppPassword: gmailPassInput.trim() || undefined,
@@ -526,17 +554,22 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
       );
       if (resp.configured) {
         setEmailServerConfigured(true);
+        setShowEmailConfigBox(false);
+        onNotify(
+          '¡Envío automático activado en PostgreSQL! Reenviando entrada QR al correo...',
+          'success'
+        );
+      } else {
+        onNotify(
+          'Pega la URL de tu script de Google (https://script.google.com/macros/s/.../exec) o una clave API (xkeysib-... / re_...).',
+          'error'
+        );
       }
-      onNotify(
-        '¡Envío automático activado! Todas las entradas QR se enviarán directo al correo en compras, aprobaciones y simulaciones.',
-        'success'
-      );
       setGmailPassInput('');
       setBrevoKeyInput('');
       setResendKeyInput('');
       setSmartKeyInput('');
-      setShowEmailConfigBox(false);
-      if (resendTicketAfterSave && emailTestResult) {
+      if (resp.configured && resendTicketAfterSave && emailTestResult) {
         await handleSendTicketEmail(
           emailTestResult.ticketId,
           undefined,
@@ -747,15 +780,25 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
           </div>
 
           {/* Barra de confirmación de entrega automática a bandeja y feedback de validación en puerta */}
-          <div className="border-b border-zinc-200 bg-white px-4 py-2 dark:border-zinc-800 dark:bg-zinc-950">
+          <div className="border-b border-zinc-200 bg-white px-4 py-2.5 dark:border-zinc-800 dark:bg-zinc-950 space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                <span>
-                  {emailTestResult.providerNote ||
-                    `✓ Pase QR enviado automáticamente a la bandeja de ${emailTestResult.recipient}`}
-                </span>
-              </div>
+              {emailTestResult.sentRealSmtp ? (
+                <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    {emailTestResult.providerNote ||
+                      `✓ Enviado automáticamente a la bandeja de ${emailTestResult.recipient}`}
+                  </span>
+                </div>
+              ) : (
+                <div className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-amber-600 dark:text-amber-400">
+                  <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    {emailTestResult.providerNote ||
+                      `Pase QR listo en pantalla. Pega abajo tu URL de Google Script (HTTPS 443) por única vez para que llegue a ${emailTestResult.recipient}.`}
+                  </span>
+                </div>
+              )}
               {doorTestFeedback && (
                 <div
                   className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold ${
@@ -769,6 +812,43 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                 </div>
               )}
             </div>
+
+            {!emailTestResult.sentRealSmtp && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    copyField('Código Puente Gmail Automático', GOOGLE_APPS_SCRIPT_SNIPPET)
+                  }
+                  className="shrink-0 rounded-md border border-red-500/40 bg-red-500/15 px-2.5 py-1 text-[11px] font-bold text-[#E50914] hover:bg-red-500/25"
+                >
+                  1. Copiar Código Google
+                </button>
+                <a
+                  href="https://script.google.com/home/start"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="shrink-0 rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-zinc-800 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                >
+                  2. Abrir script.google.com ↗
+                </a>
+                <input
+                  type="text"
+                  value={gmailWebhookInput}
+                  onChange={(e) => setGmailWebhookInput(e.target.value)}
+                  placeholder="3. Pega aquí la URL https://script.google.com/macros/s/.../exec"
+                  className="min-w-[220px] flex-1 rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
+                />
+                <button
+                  type="button"
+                  disabled={savingEmailConfig}
+                  onClick={() => handleSaveEmailConfig(true)}
+                  className="shrink-0 rounded-md bg-[#E50914] px-3 py-1 text-[11px] font-bold text-white hover:bg-[#c80812] disabled:opacity-50"
+                >
+                  {savingEmailConfig ? 'Enviando...' : 'Activar y Enviar a Gmail Ahora'}
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Iframe con el HTML real del correo (100% idéntico a lo que llega a Gmail) */}
@@ -1237,11 +1317,12 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <div>
                   <p className="text-xs font-bold text-zinc-900 dark:text-white">
-                    Envío 100% Automático de Entradas QR a la Bandeja de Cualquier Comprador (Sin bloqueos en Render)
+                    Activar Envío Automático a Gmail (1 sola vez · Guardado permanente en PostgreSQL)
                   </p>
                   <p className="mt-1 text-[11px] text-zinc-600 dark:text-zinc-300">
-                    <strong>Método A (Puente Gmail HTTPS - 100% Gratis y sin bloqueo de puerto en Render):</strong>{' '}
-                    Entra a{' '}
+                    Como Render bloquea el puerto SMTP 465, usa tu propio Gmail vía HTTPS (puerto 443):{' '}
+                    <strong>1)</strong> Pulsa <em>Copiar Código Automático</em>,{' '}
+                    <strong>2)</strong> Abre{' '}
                     <a
                       href="https://script.google.com/home/start"
                       target="_blank"
@@ -1249,38 +1330,40 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                       className="font-semibold text-[#E50914] underline"
                     >
                       script.google.com
-                    </a>
-                    , crea un proyecto nuevo, pega el código automático de 1 clic, pulsa <em>Implementar &gt; Aplicación web (Acceso: Cualquier persona)</em> y pega aquí la URL:
+                    </a>{' '}
+                    &gt; <em>Nuevo proyecto</em>, borra lo que haya, pega el código y pulsa{' '}
+                    <strong>Implementar &gt; Nueva implementación &gt; Aplicación web (Quienes tienen acceso: Cualquier persona)</strong>,{' '}
+                    <strong>3)</strong> Pega aquí la URL <code>https://script.google.com/macros/s/.../exec</code>:
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
-                    disabled={connectingGoogleEmail}
-                    onClick={() => handleConnectGoogleGmailScope(false)}
-                    className="shrink-0 rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-bold text-white hover:bg-blue-700 disabled:opacity-50"
-                  >
-                    {connectingGoogleEmail ? 'Conectando...' : 'Vincular con Google (OAuth 1 Clic)'}
-                  </button>
-                  <button
-                    type="button"
                     onClick={() =>
                       copyField('Código Puente Gmail Automático', GOOGLE_APPS_SCRIPT_SNIPPET)
                     }
-                    className="shrink-0 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[11px] font-bold text-[#E50914] hover:bg-red-500/20"
+                    className="shrink-0 rounded-lg border border-red-500/40 bg-red-500/15 px-3 py-1.5 text-[11px] font-bold text-[#E50914] hover:bg-red-500/25"
                   >
-                    Copiar Código Automático (1 Clic)
+                    1. Copiar Código Automático
                   </button>
+                  <a
+                    href="https://script.google.com/home/start"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-[11px] font-semibold text-zinc-800 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                  >
+                    2. Abrir script.google.com ↗
+                  </a>
                 </div>
               </div>
 
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-12">
                 <div className="sm:col-span-9">
                   <input
-                    type="url"
+                    type="text"
                     value={gmailWebhookInput}
                     onChange={(e) => setGmailWebhookInput(e.target.value)}
-                    placeholder="URL de tu Puente Gmail HTTPS (https://script.google.com/macros/s/.../exec)"
+                    placeholder="3. Pega aquí tu URL https://script.google.com/macros/s/.../exec (o clave xkeysib-... / re_...)"
                     className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
                   />
                 </div>
@@ -1288,40 +1371,11 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
                   <button
                     type="button"
                     disabled={savingEmailConfig}
-                    onClick={() => handleSaveEmailConfig(false)}
+                    onClick={() => handleSaveEmailConfig(true)}
                     className="w-full rounded-lg bg-[#E50914] px-3 py-2 text-xs font-semibold text-white hover:bg-[#c80812]"
                   >
-                    {savingEmailConfig ? 'Guardando...' : 'Guardar y Activar'}
+                    {savingEmailConfig ? 'Activando...' : 'Guardar y Enviar Prueba'}
                   </button>
-                </div>
-              </div>
-
-              <div className="border-t border-zinc-200/70 pt-2.5 dark:border-zinc-800">
-                <p className="text-[11px] text-zinc-500 mb-2">
-                  <strong>Método B (Alternativo - Gmail App Password / Brevo API / Resend API):</strong>
-                </p>
-                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
-                  <input
-                    type="email"
-                    value={gmailUserInput}
-                    onChange={(e) => setGmailUserInput(e.target.value)}
-                    placeholder="Tu Correo Gmail (ej. forgen122@gmail.com)"
-                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
-                  />
-                  <input
-                    type="password"
-                    value={gmailPassInput}
-                    onChange={(e) => setGmailPassInput(e.target.value)}
-                    placeholder="Contraseña de Aplicación Google (16 letras)"
-                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
-                  />
-                  <input
-                    type="password"
-                    value={resendKeyInput}
-                    onChange={(e) => setResendKeyInput(e.target.value)}
-                    placeholder="O clave RESEND_API_KEY (re_...) / BREVO (xkeysib-...)"
-                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-white"
-                  />
                 </div>
               </div>
             </div>

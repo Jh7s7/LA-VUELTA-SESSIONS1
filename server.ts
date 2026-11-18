@@ -3577,6 +3577,10 @@ async function startServer() {
         changed = true;
       }
     }
+    if (input.clearSmtpPassword) {
+      delete (db.settings as any).gmailAppPassword;
+      changed = true;
+    }
     if (input.emailFrom !== undefined && String(input.emailFrom || '').trim()) {
       (db.settings as any).emailFrom = String(input.emailFrom || '').trim().slice(0, 120);
       changed = true;
@@ -3658,15 +3662,13 @@ async function startServer() {
     ).trim();
     const brevoApiKey = String((db.settings as any)?.brevoApiKey || process.env.BREVO_API_KEY || '').trim();
     const configuredResendKey = String((db.settings as any)?.resendApiKey || '').trim() || getActiveResendKey();
-    const hasFirebaseRelay = Boolean(firebaseConfig.apiKey);
 
     const hasExternalConnector = Boolean(
       gmailWebhookUrl ||
         gmailAccessToken ||
         (gmailUser && gmailAppPassword) ||
         brevoApiKey ||
-        configuredResendKey ||
-        hasFirebaseRelay
+        configuredResendKey
     );
 
     const logId = `NL-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`;
@@ -3688,7 +3690,7 @@ async function startServer() {
 
     let sentRealSmtp = false;
     let providerNote =
-      'Pase QR generado al instante (<20ms) y listo en pantalla para escanear con LK-Validador.';
+      'Pase QR generado al instante (<20ms) y listo en pantalla para escanear con LK-Validador. Activa el Puente Gmail HTTPS (puerto 443) abajo para entrega automática en Gmail.';
 
     if (hasExternalConnector) {
       const executeExternalSend = async (): Promise<{ sent: boolean; note: string }> => {
@@ -3730,21 +3732,36 @@ async function startServer() {
               body: JSON.stringify({
                 to: recipientEmail,
                 subject: emailSubject,
-                htmlBody: gmailCidEmailHtml,
+                htmlBody: smtpEmailHtml,
+                cidHtmlBody: gmailCidEmailHtml,
                 attachments,
               }),
             });
             clearTimeout(timer);
             const bodyText = await wResp.text().catch(() => '');
-            if (wResp.ok && !bodyText.includes('accounts.google.com/ServiceLogin')) {
+            let parsedJson: any = null;
+            try {
+              parsedJson = JSON.parse(bodyText);
+            } catch {}
+
+            if (
+              wResp.ok &&
+              !bodyText.includes('accounts.google.com/ServiceLogin') &&
+              !bodyText.includes('No se ha encontrado la función') &&
+              (!parsedJson || parsedJson.ok !== false)
+            ) {
               return {
                 sent: true,
                 note: `✓ Enviado automáticamente a la bandeja de ${recipientEmail} vía Google Gmail HTTPS.`,
               };
             }
-            note = bodyText.includes('ServiceLogin')
-              ? 'El script de Google requiere seleccionar Acceso: "Cualquier persona" al implementarlo.'
-              : `Puente Gmail HTTP ${wResp.status}`;
+            if (parsedJson && parsedJson.error) {
+              note = `Error Script Google: ${parsedJson.error}`;
+            } else if (bodyText.includes('ServiceLogin')) {
+              note = 'En script.google.com > Implementar > Quienes tienen acceso: selecciona "Cualquier persona".';
+            } else {
+              note = `Puente Gmail HTTP ${wResp.status}`;
+            }
           } catch (err: any) {
             note = `Puente Gmail HTTPS: ${err.message}`;
           }
@@ -3790,7 +3807,11 @@ async function startServer() {
                 note: `✓ Enviado automáticamente a ${recipientEmail} vía Brevo HTTPS.`,
               };
             }
-          } catch {}
+            const bErr = await bResp.text().catch(() => '');
+            note = `Brevo HTTPS (${bResp.status}): ${bErr.slice(0, 100)}`;
+          } catch (err: any) {
+            note = `Brevo HTTPS: ${err.message}`;
+          }
         }
 
         // 4. Resend HTTPS API (Port 443)
@@ -3825,10 +3846,14 @@ async function startServer() {
                 note: `✓ Enviado automáticamente a ${recipientEmail} con QR adjunto vía Resend HTTPS.`,
               };
             }
-          } catch {}
+            const rErr = await rResp.text().catch(() => '');
+            note = `Resend HTTPS (${rResp.status}): ${rErr.slice(0, 100)}`;
+          } catch (err: any) {
+            note = `Resend HTTPS: ${err.message}`;
+          }
         }
 
-        // 5. Direct Gmail SMTP (Port 465 with fast 3.5s timeout)
+        // 5. Direct Gmail SMTP (Port 465 - Works outside Render Free Tier)
         if (gmailUser && gmailAppPassword) {
           const gmailResult = await sendEmailViaNativeGmailSmtp({
             gmailUser,
@@ -3841,100 +3866,9 @@ async function startServer() {
           if (gmailResult.ok) {
             return { sent: true, note: gmailResult.note };
           }
-          note = gmailResult.note;
-        }
-
-        // 6. Built-In Zero-Config Google Firebase Automatic Email Relay (Port 443 HTTPS - Works 100% automatically on Render with zero user setup!)
-        if (firebaseConfig.apiKey) {
-          try {
-            const cleanTo = recipientEmail.trim().toLowerCase();
-            const [localPart, domainPart] = cleanTo.split('@');
-            const isGmail = domainPart === 'gmail.com' || domainPart === 'googlemail.com';
-            const baseLocal = (localPart || '').split('+')[0];
-            const randTag = `${ticket.code.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(-5)}${crypto.randomBytes(2).toString('hex')}`;
-            const targetRelayEmail =
-              isGmail && baseLocal ? `${baseLocal}+${randTag}@${domainPart}` : cleanTo;
-
-            const paseUrl = `${appUrl}/pase/${encodeURIComponent(ticket.code)}?t=${encodeURIComponent(ticket.id)}&e=${encodeURIComponent(cleanTo)}`;
-            const customDisplayName = `🎟️ LA VUELTA SESSIONS · Pase QR [${ticket.code}] (${String(event.title || 'Evento Oficial').slice(0, 26)}) · Ver y Descargar Pase QR: ${paseUrl} · Código: ${ticket.code}`;
-            const detPassword = `LvsQr#${crypto.createHash('sha256').update(`${targetRelayEmail}:${QR_SECRET}`).digest('hex').slice(0, 14)}!`;
-
-            let idToken = '';
-            const signUpResp = await fetch(
-              `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  email: targetRelayEmail,
-                  password: detPassword,
-                  displayName: customDisplayName,
-                  returnSecureToken: true,
-                }),
-              }
-            );
-            const signUpJson = (await signUpResp.json().catch(() => ({}))) as any;
-
-            if (signUpResp.ok && signUpJson?.idToken) {
-              idToken = signUpJson.idToken;
-            } else if (signUpJson?.error?.message?.includes('EMAIL_EXISTS')) {
-              const signInResp = await fetch(
-                `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-                {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    email: targetRelayEmail,
-                    password: detPassword,
-                    returnSecureToken: true,
-                  }),
-                }
-              );
-              const signInJson = (await signInResp.json().catch(() => ({}))) as any;
-              if (signInResp.ok && signInJson?.idToken) {
-                idToken = signInJson.idToken;
-              }
-            }
-
-            if (idToken) {
-              // Ensure displayName with the ticket code & direct /pase/:code QR URL is persisted before sending email
-              await fetch(
-                `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-                {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    idToken,
-                    displayName: customDisplayName,
-                    returnSecureToken: false,
-                  }),
-                }
-              ).catch(() => null);
-
-              const oobResp = await fetch(
-                `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-                {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'X-Firebase-Locale': 'es',
-                  },
-                  body: JSON.stringify({
-                    requestType: 'VERIFY_EMAIL',
-                    idToken,
-                  }),
-                }
-              );
-              if (oobResp.ok) {
-                return {
-                  sent: true,
-                  note: `✓ Enviado automáticamente a la bandeja de ${cleanTo} vía Google Automático (HTTPS 443).`,
-                };
-              }
-            }
-          } catch (fbErr: any) {
-            note = `Aviso Google Relay: ${fbErr.message}`;
-          }
+          note =
+            gmailResult.note ||
+            'Render Free Tier bloquea el puerto SMTP 465. Usa el Puente Google Gmail HTTPS (puerto 443).';
         }
 
         return {
@@ -3952,17 +3886,16 @@ async function startServer() {
         return resObj;
       });
 
-      // Wait up to 3,200ms so Google HTTPS relay returns real confirmation immediately
       const fastResult = await Promise.race([
         sendPromise,
         new Promise<{ sent: boolean; note: string }>((resolve) =>
           setTimeout(
             () =>
               resolve({
-                sent: true,
-                note: `✓ Enviado automáticamente a la bandeja de ${recipientEmail} en segundo plano.`,
+                sent: false,
+                note: `Tiempo de espera agotado al contactar el servidor de correo para ${recipientEmail}.`,
               }),
-            3200
+            10000
           )
         ),
       ]);
@@ -4399,8 +4332,7 @@ async function startServer() {
       );
       const brevoConfigured = Boolean((db.settings as any)?.brevoApiKey || process.env.BREVO_API_KEY);
       const resendConfigured = Boolean((db.settings as any)?.resendApiKey || getActiveResendKey());
-      const firebaseRelayConfigured = Boolean(firebaseConfig.apiKey);
-      const isConfigured = gmailConfigured || brevoConfigured || resendConfigured || firebaseRelayConfigured;
+      const isConfigured = gmailConfigured || brevoConfigured || resendConfigured;
       res.json({
         ok: true,
         configured: isConfigured,
@@ -4409,7 +4341,6 @@ async function startServer() {
         gmailUser,
         brevoConfigured,
         resendConfigured,
-        firebaseRelayConfigured,
         emailProviderConfigured: isConfigured,
         emailFrom: (db.settings as any)?.emailFrom || process.env.EMAIL_FROM || 'LA VUELTA SESSIONS <onboarding@resend.dev>',
       });
@@ -4428,8 +4359,7 @@ async function startServer() {
       );
       const activeBrevo = Boolean((db.settings as any).brevoApiKey);
       const activeResend = Boolean((db.settings as any).resendApiKey || getActiveResendKey());
-      const activeFirebaseRelay = Boolean(firebaseConfig.apiKey);
-      const isConfigured = activeGmail || activeBrevo || activeResend || activeFirebaseRelay;
+      const isConfigured = activeGmail || activeBrevo || activeResend;
       appendAudit(
         req.user!,
         'UPDATE_EMAIL_CONFIG',
@@ -4446,7 +4376,6 @@ async function startServer() {
         gmailUser: (db.settings as any).gmailUser || 'forgen122@gmail.com',
         brevoConfigured: activeBrevo,
         resendConfigured: activeResend,
-        firebaseRelayConfigured: activeFirebaseRelay,
         emailProviderConfigured: isConfigured,
         emailFrom: (db.settings as any).emailFrom || process.env.EMAIL_FROM || 'LA VUELTA SESSIONS <onboarding@resend.dev>',
       });
