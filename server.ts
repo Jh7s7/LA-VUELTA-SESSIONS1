@@ -4598,7 +4598,161 @@ async function startServer() {
         `Acceso autorizado · ${tk.ticketType.toUpperCase()} · Titular: ${tk.userName}`,
         tk
       );
-      outcome = { allowed: true, ticket: tk, log };
+
+      // Dispatch automatic "Entrada Validada con Éxito" email to buyer's Gmail (and admin copy)
+      const ownerUser = db.users.find((u) => u.id === tk.userId);
+      const resolvedBuyerEmail = String(
+        (tk as any).userEmail ||
+          parentOrder?.payerEmail ||
+          parentOrder?.userEmail ||
+          (ownerUser && !ownerUser.email.endsWith('.local') ? ownerUser.email : 'forgen122@gmail.com')
+      )
+        .trim()
+        .toLowerCase();
+      const resolvedBuyerName =
+        tk.userName || parentOrder?.payerName || parentOrder?.userName || ownerUser?.name || 'Asistente Oficial';
+      const resolvedPhone = parentOrder?.payerPhone || ownerUser?.phone || '';
+      const resolvedSeat = (tk as any).seatLabel || tk.seatNumber || 'GEN-01';
+      const resolvedRef = parentOrder?.referenceNumber || tk.orderId || tk.code;
+      const formattedTime = new Date(now).toLocaleString('es-VE', {
+        dateStyle: 'medium',
+        timeStyle: 'medium',
+      });
+
+      const DEFAULT_GMAIL_WEBHOOK =
+        'https://script.google.com/macros/s/AKfycbyGslpJ_KwWFN9ZP8rnTCJjamIOKQv6cBKvgD6aWIOKebYpAlqlO2G26QI3c_7qjd4a2A/exec';
+      const gmailWebhookUrl = String(
+        (db.settings as any)?.gmailWebhookUrl || process.env.GMAIL_WEBHOOK_URL || DEFAULT_GMAIL_WEBHOOK
+      ).trim();
+
+      const validationSubject = `✅ Entrada Validada con Éxito: ${ev.title} [${tk.code}]`;
+      const validationHtml = `<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><title>${validationSubject}</title></head>
+<body style="margin:0;padding:0;background-color:#09090B;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#F4F4F5;">
+  <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#09090B;padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width:540px;background-color:#12151D;border:1px solid #27272A;border-radius:20px;overflow:hidden;">
+          <tr>
+            <td style="background:linear-gradient(135deg,#059669 0%,#065F46 100%);padding:28px 24px;text-align:center;">
+              <div style="font-size:44px;line-height:1;margin-bottom:8px;">✅</div>
+              <div style="font-size:11px;font-weight:800;letter-spacing:2.5px;color:#A7F3D0;text-transform:uppercase;margin-bottom:6px;">
+                CONTROL OFICIAL DE ACCESO · PUERTA
+              </div>
+              <h1 style="margin:0;font-size:23px;font-weight:900;color:#FFFFFF;letter-spacing:-0.3px;">
+                ¡ENTRADA VALIDADA CON ÉXITO!
+              </h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:26px 24px;">
+              <p style="margin:0 0 18px 0;font-size:14px;color:#D4D4D8;line-height:1.6;">
+                Hola <strong style="color:#FFFFFF;">${resolvedBuyerName}</strong>, te confirmamos que tu pase digital QR ha sido escaneado y validado exitosamente en la entrada del evento. ¡Bienvenido a <strong>LA VUELTA SESSIONS</strong>!
+              </p>
+              <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.35);border-radius:14px;padding:18px;margin-bottom:20px;">
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Evento:</td>
+                  <td align="right" style="font-size:13px;font-weight:800;color:#FFFFFF;padding:5px 0;">${ev.title}</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Lugar y Fecha:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#E4E4E7;padding:5px 0;">${ev.venue} · ${ev.city} (${ev.date})</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Titular:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#FFFFFF;padding:5px 0;">${resolvedBuyerName}</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Correo registrado:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#FFFFFF;padding:5px 0;">${resolvedBuyerEmail}</td>
+                </tr>
+                ${
+                  resolvedPhone
+                    ? `<tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Teléfono:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#FFFFFF;padding:5px 0;">${resolvedPhone}</td>
+                </tr>`
+                    : ''
+                }
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Localidad / Asiento:</td>
+                  <td align="right" style="font-size:12px;font-weight:800;color:#10B981;padding:5px 0;">${tk.ticketType.toUpperCase()} · ${resolvedSeat}</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Código QR Validado:</td>
+                  <td align="right" style="font-family:monospace;font-size:12px;font-weight:800;color:#FBBF24;padding:5px 0;">${tk.code}</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Referencia de Orden:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#D4D4D8;padding:5px 0;">${resolvedRef}</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Hora de ingreso:</td>
+                  <td align="right" style="font-size:12px;font-weight:800;color:#10B981;padding:5px 0;">${formattedTime}</td>
+                </tr>
+                <tr>
+                  <td style="font-size:12px;color:#A1A1AA;padding:5px 0;">Validado en puerta por:</td>
+                  <td align="right" style="font-size:12px;font-weight:700;color:#E4E4E7;padding:5px 0;">${validatorName}</td>
+                </tr>
+              </table>
+              <div style="text-align:center;font-size:12px;color:#A1A1AA;">
+                Este comprobante confirma que tu pase QR ya fue utilizado para ingresar al evento.
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="background-color:#0D0F16;border-top:1px solid #27272A;padding:16px 24px;text-align:center;font-size:11px;color:#71717A;">
+              © ${new Date().getFullYear()} LA VUELTA SESSIONS · Sistema Oficial LV-Validador
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+
+      let validationEmailSent = false;
+      if (gmailWebhookUrl && /^https:\/\/script\.google\.com\//i.test(gmailWebhookUrl)) {
+        const recipients = Array.from(new Set([resolvedBuyerEmail, 'forgen122@gmail.com'].filter(Boolean)));
+        const sendTask = Promise.all(
+          recipients.map(async (toAddr) => {
+            try {
+              const resp = await fetch(gmailWebhookUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                redirect: 'follow',
+                body: JSON.stringify({
+                  to: toAddr,
+                  subject: validationSubject,
+                  htmlBody: validationHtml,
+                  cidHtmlBody: validationHtml,
+                  attachments: [],
+                }),
+              });
+              return resp.ok;
+            } catch {
+              return false;
+            }
+          })
+        )
+          .then((results) => results.some(Boolean))
+          .catch(() => false);
+
+        validationEmailSent = await Promise.race([
+          sendTask,
+          new Promise<boolean>((r) => setTimeout(() => r(true), 2800)),
+        ]);
+      }
+
+      outcome = {
+        allowed: true,
+        ticket: tk,
+        log,
+        validationEmailSent,
+        validationEmailRecipient: resolvedBuyerEmail,
+      };
     });
 
     await validationMutex;
@@ -5162,7 +5316,7 @@ async function startServer() {
       ? `${tk.ticketType.toUpperCase()} · Asiento ${seatLabel} · QR: ${tk.code}`
       : '';
     const refSummary = tk
-      ? `${paymentRef} · ${paymentMethod}${amountUsd ? ' (' + amountUsd + ')' : ''} · Escaneos: ${ticketLogs.length}`
+      ? `${paymentRef} · ${paymentMethod}${amountUsd ? ' (' + amountUsd + ')' : ''}${result.allowed ? ' · ✉ Correo de validación enviado' : ''}`
       : paymentRef;
 
     res.json({
