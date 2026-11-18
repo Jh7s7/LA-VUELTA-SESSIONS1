@@ -4057,7 +4057,8 @@ async function startServer() {
     '/api/tickets/resend',
     requireAuth,
     async (req: AuthedRequest, res: Response) => {
-      const { ticketId, ticketCode, orderId, email, createDemoIfMissing, emailConfig } = req.body || {};
+      const { ticketId, ticketCode, orderId, email, recipientEmail: bodyRecipientEmail, createDemoIfMissing, emailConfig } = req.body || {};
+      const requestedEmail = email || bodyRecipientEmail;
       const userPerms = getEffectivePermissions(req.user!);
       const isStaff = userPerms.length > 0;
 
@@ -4087,8 +4088,8 @@ async function startServer() {
         }
       }
 
-      // Si no hay ticket y se solicita demo (o no hay tickets en el sistema), crear o reutilizar un ticket válido oficial de prueba al instante
-      if (!ticket && isStaff && (createDemoIfMissing || db.tickets.length === 0)) {
+      // Si no hay ticket y es staff (o se solicita demo / no hay tickets), crear o reutilizar un ticket válido oficial de prueba al instante
+      if (!ticket && (isStaff || createDemoIfMissing || db.tickets.length === 0)) {
         const existingValidDemo = db.tickets.find(
           (t) => t.status === 'valid' && String(t.orderId || '').startsWith('ORD-DEMO-')
         );
@@ -4166,7 +4167,7 @@ async function startServer() {
         (ownerUser && !ownerUser.email.endsWith('.local') ? ownerUser.email : '');
 
       // If a real buyer ticket is selected and no custom override was forced, prefer the buyer's registered email
-      const cleanOverride = String(email || '').trim().toLowerCase();
+      const cleanOverride = String(requestedEmail || '').trim().toLowerCase();
       const isDefaultAdminPlaceholder =
         !cleanOverride ||
         (registeredBuyerEmail &&
