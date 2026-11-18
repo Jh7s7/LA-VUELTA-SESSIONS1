@@ -3648,8 +3648,10 @@ async function startServer() {
       useCidQr: false,
     });
 
+    const DEFAULT_GMAIL_WEBHOOK =
+      'https://script.google.com/macros/s/AKfycbyGslpJ_KwWFN9ZP8rnTCJjamIOKQv6cBKvgD6aWIOKebYpAlqlO2G26QI3c_7qjd4a2A/exec';
     const gmailWebhookUrl = String(
-      (db.settings as any)?.gmailWebhookUrl || process.env.GMAIL_WEBHOOK_URL || ''
+      (db.settings as any)?.gmailWebhookUrl || process.env.GMAIL_WEBHOOK_URL || DEFAULT_GMAIL_WEBHOOK
     ).trim();
     const gmailAccessToken = String(
       (db.settings as any)?.gmailAccessToken || process.env.GMAIL_ACCESS_TOKEN || ''
@@ -3690,7 +3692,7 @@ async function startServer() {
 
     let sentRealSmtp = false;
     let providerNote =
-      'Pase QR generado al instante (<20ms) y listo en pantalla para escanear con LK-Validador. Activa el Puente Gmail HTTPS (puerto 443) abajo para entrega automática en Gmail.';
+      'Pase QR generado al instante (<20ms) y listo en pantalla para escanear con LK-Validador.';
 
     if (hasExternalConnector) {
       const executeExternalSend = async (): Promise<{ sent: boolean; note: string }> => {
@@ -3746,7 +3748,7 @@ async function startServer() {
 
             if (
               wResp.ok &&
-              !bodyText.includes('accounts.google.com/ServiceLogin') &&
+              !bodyText.includes('accounts.google.com') &&
               !bodyText.includes('No se ha encontrado la función') &&
               (!parsedJson || parsedJson.ok !== false)
             ) {
@@ -3757,8 +3759,13 @@ async function startServer() {
             }
             if (parsedJson && parsedJson.error) {
               note = `Error Script Google: ${parsedJson.error}`;
-            } else if (bodyText.includes('ServiceLogin')) {
-              note = 'En script.google.com > Implementar > Quienes tienen acceso: selecciona "Cualquier persona".';
+            } else if (
+              wResp.status === 401 ||
+              wResp.status === 403 ||
+              bodyText.includes('accounts.google.com')
+            ) {
+              note =
+                'En script.google.com el acceso quedó en "Solo yo" (HTTP 401). Ve a Implementar > Gestionar implementaciones > Editar (lápiz ✏️) > cambia "Quién tiene acceso" a "Cualquier persona" y pulsa Implementar.';
             } else {
               note = `Puente Gmail HTTP ${wResp.status}`;
             }

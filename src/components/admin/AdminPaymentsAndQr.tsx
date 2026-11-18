@@ -320,7 +320,9 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
     }
   };
 
-  const [gmailWebhookInput, setGmailWebhookInput] = useState('');
+  const [gmailWebhookInput, setGmailWebhookInput] = useState(
+    'https://script.google.com/macros/s/AKfycbyGslpJ_KwWFN9ZP8rnTCJjamIOKQv6cBKvgD6aWIOKebYpAlqlO2G26QI3c_7qjd4a2A/exec'
+  );
   const [gmailUserInput, setGmailUserInput] = useState('forgen122@gmail.com');
   const [gmailPassInput, setGmailPassInput] = useState('');
   const [brevoKeyInput, setBrevoKeyInput] = useState('');
@@ -330,7 +332,7 @@ export const AdminPaymentsAndQr: React.FC<AdminPaymentsAndQrProps> = ({
   const [savingEmailConfig, setSavingEmailConfig] = useState(false);
   const [connectingGoogleEmail, setConnectingGoogleEmail] = useState(false);
   const [showEmailConfigBox, setShowEmailConfigBox] = useState(false);
-  const [emailServerConfigured, setEmailServerConfigured] = useState(false);
+  const [emailServerConfigured, setEmailServerConfigured] = useState(true);
 
   useEffect(() => {
     const saved = getStoredEmailConfig();
